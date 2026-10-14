@@ -1,0 +1,38 @@
+{
+  "python.languageServer": "Pylance",
+  // Ruff config.
+  "[python]": {
+    "editor.detectIndentation": false,
+    "editor.insertSpaces": true,
+    "editor.tabSize": 4,
+    "editor.defaultFormatter": "charliermarsh.ruff",
+    "editor.codeActionsOnSave": {
+      "source.fixAll": "explicit",
+      "source.organizeImports": "explicit"
+    },
+    "editor.formatOnSave": true
+  },
+  "notebook.formatOnSave.enabled": true,
+  "notebook.codeActionsOnSave": {
+    "notebook.source.fixAll": "explicit",
+    "notebook.source.organizeImports": "explicit"
+  },
+  "ruff.importStrategy": "fromEnvironment",
+  // MyPy config.
+  "mypy-type-checker.args": [
+    "--config-file=pyproject.toml"
+  ],
+  "mypy-type-checker.importStrategy": "fromEnvironment",
+  // autoDocstring config.
+  "autoDocstring.docstringFormat": "numpy",
+  "autoDocstring.includeName": true,
+  "autoDocstring.startOnNewLine": false,
+  "autoDocstring.generateDocstringOnEnter": true,
+  // Files config.
+  "files.trimTrailingWhitespace": true,
+  "files.trimFinalNewlines": true,
+  // Editor config.
+  "editor.renderWhitespace": "boundary",
+  "editor.formatOnSave": true,
+  "pythonIndent.trimLinesWithOnlyWhitespace": true
+}

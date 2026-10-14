@@ -1,0 +1,12 @@
+git+https://github.com/we-are-melonn/lib-python-aws-utils.git@e82ce8716b324187407f4484f7c61d603a9730b8
+git+https://github.com/we-are-melonn/lib-python-redshift-connector.git@e1af265513a1df6a72f8079f055251fdeacb866b
+git+https://github.com/we-are-melonn/lib-python-custom-errors.git@f02877062b83a5a93ce3d88512fd3beb4d7597e6
+git+https://github.com/we-are-melonn/lib-python-slack-notifier.git@fb47159d82d3b998be89a0f4890a2f0f999b61db
+
+python-dotenv==1.0.1
+boto3==1.36.24
+
+# Linting/Tooling
+mypy==1.15.0
+ruff==0.9.6
+cfn-lint==1.25.1

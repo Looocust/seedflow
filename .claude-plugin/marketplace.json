@@ -1,0 +1,14 @@
+{
+  "name": "looocust",
+  "description": "Plugins propios para crear y mantener proyectos con Claude Code.",
+  "owner": {
+    "name": "Looocust"
+  },
+  "plugins": [
+    {
+      "name": "seedflow",
+      "source": "./plugins/seedflow",
+      "description": "Crea proyectos y microservicios con la estructura de Melonn: hace las preguntas, arma la estructura con un script y deja el código conectado a las librerías lib-python-*."
+    }
+  ]
+}
