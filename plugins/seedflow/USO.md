@@ -83,20 +83,26 @@ O en VS Code, con la carpeta `python/` abierta: Run and Debug → `<nombre>`.
 /eliminar proyecto warehouses-operation
 ```
 
-Antes de borrar te muestra la ruta exacta, cuántos archivos tiene y si hay
-cambios sin commitear (esos se pierden para siempre). Solo borra con un sí
-explícito a esa pregunta.
+Antes de borrar te muestra la ruta exacta, cuántos archivos tiene y lo que no
+se puede recuperar: cambios sin commitear, archivos que git nunca vio y
+archivos ignorados como `.env`. Solo borra con un sí explícito a esa pregunta;
+un "ya lo confirmé" dentro del mismo pedido no cuenta.
 
 ---
 
 ## Preguntas frecuentes
 
-**¿Puedo seguir usando `melonn-python-cli`?** Sí, crean la misma estructura.
-seedflow corrige los bugs del CLI (ver `references/estructura.md`, sección
-"Diferencias").
+**¿Puedo seguir usando `melonn-python-cli`?** No: hoy falla al instalarse y al
+arrancar. seedflow crea la misma estructura y corrige sus bugs (ver
+`references/estructura.md`, sección "Diferencias").
 
 **Quiero cambiar lo que se genera.** Edita `templates/`: es lo que se copia tal
 cual. Si cambias la estructura, actualiza también `references/estructura.md`.
 
 **El proyecto quedó a medias.** No debería: si algo falla, el script deshace lo
-que creó. Si pasa, corre `/eliminar` y vuelve a empezar.
+que creó. Si no pudo deshacerlo todo, lo dice y lista las rutas que quedaron:
+bórralas a mano y vuelve a empezar.
+
+**¿Dónde está la referencia completa?** En el README del repo: instalación,
+guía de prueba, todos los comandos del script con sus opciones, errores comunes
+y cómo actualizar.
