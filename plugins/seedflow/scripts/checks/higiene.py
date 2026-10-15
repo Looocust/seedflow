@@ -45,8 +45,9 @@ SECRET_NAME = re.compile(r"(password|secret|token)$", re.IGNORECASE)
 QUERY_METHODS = {"read", "execute_query", "write"}
 # Un aviso (regla sin evaluar) no descuenta.
 POINTS = {**SEVERITY, "aviso": 0}
-# Variables que harían que git mire otro repo en lugar del temporal.
-GIT_LOCATION_VARIABLES = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE")
+# El git temporal de H2 compara con mayúsculas (como en Linux y en CI),
+# diga lo que diga el sistema de archivos: misma nota en cualquier máquina.
+GIT_FIXED_CONFIG = ("-c", "core.ignoreCase=false")
 
 
 def run(ctx: Context) -> CheckResult:
@@ -182,39 +183,42 @@ def git_ignored(patterns: bytes, paths: list[str]) -> set[str] | None:
     """Cuáles de paths ignoran estos patrones, según git (None sin git).
 
     Los evalúa en un repo temporal vacío, fuera del repo calificado, donde
-    ese .gitignore es lo único que hay.
+    ese .gitignore es lo único que hay: sin plantilla de git init y sin la
+    configuración de git de quien califica.
     """
     git = git_executable()
     if not git:
         return None
-    env = {
-        k: v for k, v in os.environ.items() if k not in GIT_LOCATION_VARIABLES
-    }
     try:
         with tempfile.TemporaryDirectory(prefix="seedflow-gitignore-") as temp:
-            folder = Path(temp)
+            base = Path(temp)
+            env = isolated_git_env(base)
+            repo = base / "repo"
             subprocess.run(
-                [git, "init", "-q", str(folder)],
+                [
+                    git,
+                    *GIT_FIXED_CONFIG,
+                    "init",
+                    "-q",
+                    f"--template={make_folder(base / 'plantilla')}",
+                    str(repo),
+                ],
                 env=env,
                 capture_output=True,
                 check=True,
                 timeout=30,
             )
-            # Una plantilla de git init podría traer exclusiones propias.
-            (folder / ".git" / "info").mkdir(parents=True, exist_ok=True)
-            (folder / ".git" / "info" / "exclude").write_bytes(b"")
-            (folder / GITIGNORE).write_bytes(patterns)
+            write_new(repo / GITIGNORE, patterns)
             result = subprocess.run(
                 [
                     git,
-                    "-c",
-                    "core.excludesFile=",
+                    *GIT_FIXED_CONFIG,
                     "check-ignore",
                     "--no-index",
                     "--stdin",
                     "-z",
                 ],
-                cwd=folder,
+                cwd=repo,
                 env=env,
                 input="\0".join(paths).encode("utf-8"),
                 capture_output=True,
@@ -226,6 +230,36 @@ def git_ignored(patterns: bytes, paths: list[str]) -> set[str] | None:
     if result.returncode not in (0, 1):
         return None
     return {os.fsdecode(p) for p in result.stdout.split(b"\0") if p}
+
+
+def isolated_git_env(base: Path) -> dict[str, str]:
+    """El entorno sin nada de git del usuario: ni GIT_*, ni su config.
+
+    Sin configuración de sistema, la global en un archivo vacío y HOME y
+    XDG_CONFIG_HOME en una carpeta vacía (ahí busca git su ignore global).
+    """
+    home = make_folder(base / "home")
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env.update(
+        GIT_CONFIG_NOSYSTEM="1",
+        GIT_CONFIG_GLOBAL=str(write_new(base / "gitconfig", b"")),
+        HOME=str(home),
+        XDG_CONFIG_HOME=str(home),
+    )
+    return env
+
+
+def make_folder(path: Path) -> Path:
+    """Crea una carpeta nueva (falla si ya existe algo ahí, aun un enlace)."""
+    path.mkdir()
+    return path
+
+
+def write_new(path: Path, data: bytes) -> Path:
+    """Crea un archivo nuevo; nunca escribe a través de algo que ya exista."""
+    with path.open("xb") as file:
+        file.write(data)
+    return path
 
 
 def lines_ignore_env(patterns: bytes) -> bool:
@@ -275,13 +309,19 @@ def add_env_to_gitignore(root: Path, fix_id: str) -> list[Path]:
 
     Decide con el mismo detector que H2: si ningún proyecto queda expuesto
     no cambia nada. No toca las demás líneas, devuelve los archivos que
-    cambió y no escribe a través de un enlace simbólico.
+    cambió y no escribe a través de un enlace simbólico ni sobre algo que
+    no sea un archivo normal.
     """
     gitignore = root / GITIGNORE
     if gitignore.is_symlink():
         raise ValueError(
             f"{gitignore} es un enlace simbólico; seedflow no escribe a "
             "través de enlaces. Agrega la línea .env a mano."
+        )
+    if gitignore.exists() and not gitignore.is_file():
+        raise ValueError(
+            f"{gitignore} no es un archivo normal; seedflow no lo toca. "
+            "Revísalo y agrega la línea .env a mano."
         )
     if not exposed_projects(root, project_names(root)):
         return []
@@ -307,6 +347,8 @@ def code_findings(root: Path, project: Project) -> list[Finding]:
     """Credenciales y queries armadas en los `.py` de python/."""
     findings = []
     for path in python_files(project.path / "python"):
+        if not path.is_file():  # una tubería o un dispositivo, no un archivo
+            continue
         source = path.read_bytes()
         relative = path.relative_to(root).as_posix()
         tree = parse(source)

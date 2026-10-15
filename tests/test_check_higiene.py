@@ -24,6 +24,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -350,6 +351,66 @@ class GitignoreTest(HigieneTestCase):
                        for p in git_dir.rglob("*"))
         self.assertEqual(after, before)
 
+    def test_la_plantilla_de_git_init_no_se_usa_ni_se_escribe(self):
+        # Una plantilla de git init (por variable y por configuración) cuyo
+        # info/exclude es un enlace a un archivo de afuera: calificar no lo
+        # toca, y lo que excluye no protege.
+        for modo in MODOS_CON_GIT:
+            with self.subTest(modo=modo):
+                self.setUp()
+                afuera = self.base / "afuera-exclude"
+                afuera.write_bytes(b".env\n# no me borres\n")
+                template = self.base / "plantilla-enlazada"
+                (template / "info").mkdir(parents=True)
+                try:
+                    (template / "info" / "exclude").symlink_to(afuera)
+                except (OSError, NotImplementedError):
+                    self.skipTest("este sistema no permite crear enlaces")
+                self.make_projects("demo", "otro")
+                self.prepare(modo, "node_modules/\n")
+                Path(os.environ["GIT_CONFIG_GLOBAL"]).write_text(
+                    f"[init]\n\ttemplateDir = {template.as_posix()}\n"
+                )
+                with mock.patch.dict(
+                    os.environ, {"GIT_TEMPLATE_DIR": str(template)}
+                ):
+                    _, findings = self.check()
+                self.assert_h2_en_cada_proyecto(findings)
+                self.assertEqual(
+                    afuera.read_bytes(), b".env\n# no me borres\n"
+                )
+
+    def test_mayusculas_no_dependen_de_la_configuracion_de_git(self):
+        # Git compara con mayúsculas (como en Linux y en CI) aunque el sistema
+        # de archivos o la configuración de quien califica digan lo contrario:
+        # mismos hallazgos y mismo arreglo en cualquier máquina.
+        config_global = self.base / "gitconfig-ignorecase"
+        config_global.write_text("[core]\n\tignoreCase = true\n")
+        entornos = {
+            "sin configuración": {},
+            "global": {"GIT_CONFIG_GLOBAL": str(config_global)},
+            "variables": {"GIT_CONFIG_COUNT": "1",
+                          "GIT_CONFIG_KEY_0": "core.ignoreCase",
+                          "GIT_CONFIG_VALUE_0": "true"},
+            "parámetros": {"GIT_CONFIG_PARAMETERS": "'core.ignorecase'='true'"},
+        }
+        for nombre, variables in entornos.items():
+            for modo in MODOS_CON_GIT:
+                with self.subTest(entorno=nombre, modo=modo):
+                    self.setUp()
+                    self.make_projects("demo", "otro")
+                    self.prepare(modo, ".ENV\n")
+                    gitignore = self.root / ".gitignore"
+                    with mock.patch.dict(os.environ, variables):
+                        _, findings = self.check()
+                        self.assert_h2_en_cada_proyecto(findings)
+                        module = self.higiene()
+                        touched = module.FIXES["H2"](self.root, "H2:.gitignore")
+                        self.assertEqual(touched, [gitignore])
+                        self.assertEqual(gitignore.read_bytes(), b".ENV\n.env\n")
+                        _, findings = self.check()
+                        self.assertEqual(findings, [])
+
     def test_el_gitignore_global_del_usuario_no_cuenta(self):
         # Dos personas con la misma copia del repo tienen que ver la misma
         # nota: lo que ignore la configuración global de una no cuenta.
@@ -473,6 +534,29 @@ class CredencialesTest(HigieneTestCase):
         report, findings = self.check()
         self.assertEqual(findings, [])
         self.assertEqual(self.score(report), 100)
+
+    def test_no_se_queda_leyendo_algo_que_no_es_un_archivo(self):
+        # Un "x.py" que es una tubería (FIFO) bloquearía la lectura para
+        # siempre; check lo salta. Corre en otro proceso, con tiempo límite.
+        if not hasattr(os, "mkfifo"):
+            self.skipTest("este sistema no tiene tuberías con nombre")
+        self.make_projects("demo")
+        self.write("projects/demo/python/a.py", f'password = "{FAKE_PASSWORD}"\n')
+        os.mkfifo(self.root / "projects" / "demo" / "python" / "b.py")
+        self.git_repo()
+        try:
+            result = subprocess.run(
+                [sys.executable, str(SCRIPT), "--root", str(self.root),
+                 "check", "--json"],
+                capture_output=True, text=True, check=False, timeout=15,
+            )
+        except subprocess.TimeoutExpired:
+            self.fail("check se quedó leyendo la tubería")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        findings = [f for f in json.loads(result.stdout)["findings"]
+                    if f["category"] == "higiene"]
+        self.assertEqual([(f["rule"], f["path"]) for f in findings],
+                         [("H3", "projects/demo/python/a.py")])
 
     def test_solo_revisa_los_py_de_python_sin_caches(self):
         self.make_projects("demo")
@@ -626,6 +710,17 @@ class ArregloTest(HigieneTestCase):
             self.fix()()
         self.assertIn(".gitignore", str(error.exception))
         self.assertEqual(afuera.read_text(), ".env\n")
+
+    def test_arreglo_gitignore_no_toca_algo_que_no_es_un_archivo(self):
+        # Una carpeta (o una tubería) llamada .gitignore: el arreglo no la
+        # lee ni la reemplaza, y lo dice.
+        self.make_projects("demo")
+        (self.root / ".gitignore").mkdir()
+        (self.root / ".gitignore" / "dentro").write_text("x")
+        with self.assertRaises(ValueError) as error:
+            self.fix()()
+        self.assertIn(".gitignore", str(error.exception))
+        self.assertEqual((self.root / ".gitignore" / "dentro").read_text(), "x")
 
     def test_las_reglas_no_escriben_en_el_repo(self):
         self.make_projects("demo")
