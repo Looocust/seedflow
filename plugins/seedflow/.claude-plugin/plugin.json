@@ -1,6 +1,6 @@
 {
   "name": "seedflow",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Scaffolding de proyectos y microservicios Melonn: preguntas en el chat, estructura determinista con un script sin dependencias y esqueleto de código con las librerías lib-python-*.",
   "author": {
     "name": "Looocust"
