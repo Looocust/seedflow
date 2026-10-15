@@ -108,3 +108,12 @@ Cuéntale también que el stack de CDK lleva el nombre del proyecto: para
 `iac/lib/stock-forecast-stack.ts`.
 
 No hagas commit: eso lo decide el usuario.
+
+Termina con la nota del repo. Corre, desde la carpeta raíz del repo:
+
+```bash
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/seedflow.py" check --quick
+```
+
+y muestra su línea tal cual, al final (es rápida: no revisa calidad de
+código). Si falla, no afecta lo creado: omítela.
