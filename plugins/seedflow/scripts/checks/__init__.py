@@ -5,7 +5,10 @@ Contrato que comparten todos los módulos de reglas de esta carpeta.
 
 from __future__ import annotations
 
+import os
+
 from collections.abc import Iterable
+from collections.abc import Iterator
 from collections.abc import Sequence
 from dataclasses import asdict
 from dataclasses import dataclass
@@ -16,6 +19,41 @@ from typing import Any
 
 CATEGORIES = ("estructura", "calidad", "dependencias", "higiene")
 SEVERITY = {"critico": 25, "importante": 10, "menor": 3}
+
+# Carpetas que ninguna regla revisa: entornos, dependencias, salidas y cachés.
+# Revisarlas haría lento el recorrido (un .venv tiene decenas de miles de
+# archivos) y daría falsos positivos con código que no es del proyecto.
+IGNORED_DIRS = frozenset(
+    {
+        ".git",
+        ".venv",
+        "venv",
+        "node_modules",
+        "cdk.out",
+        "__pycache__",
+        ".mypy_cache",
+        ".ruff_cache",
+        ".pytest_cache",
+    }
+)
+
+
+def iter_files(folder: Path, suffixes: tuple[str, ...] = ()) -> Iterator[Path]:
+    """Archivos de folder, en orden estable, sin entrar a IGNORED_DIRS.
+
+    No sigue enlaces simbólicos (ni carpetas ni archivos). Con suffixes, solo
+    devuelve los archivos con esas extensiones (p. ej. (".py",)).
+    """
+    for current, dirs, files in os.walk(folder, followlinks=False):
+        # os.walk(followlinks=False) ya no entra a carpetas enlazadas.
+        dirs[:] = sorted(d for d in dirs if d not in IGNORED_DIRS)
+        for name in sorted(files):
+            path = Path(current) / name
+            if path.is_symlink():
+                continue
+            if suffixes and not name.endswith(suffixes):
+                continue
+            yield path
 
 
 @dataclass(frozen=True)

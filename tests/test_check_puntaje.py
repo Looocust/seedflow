@@ -679,3 +679,51 @@ class DescubrimientoTest(CheckTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RecorridoTest(CheckTestCase):
+    """iter_files: recorrido común que usan las reglas (ajuste del contrato)."""
+
+    def test_iter_files_ignora_entornos_dependencias_y_caches(self):
+        base = self.root / "projects" / "demo"
+        for relative in [
+            "python/internal-services/a/src/handler.py",
+            "python/internal-services/a/src/service/main.py",
+            "python/internal-services/a/events/a.json",
+            ".venv/lib/python3.12/site-packages/x.py",
+            "python/.venv/lib/y.py",
+            "python/venv/lib/z.py",
+            "iac/node_modules/pkg/index.js",
+            "iac/cdk.out/asset.py",
+            "python/internal-services/a/src/__pycache__/m.py",
+            "python/.mypy_cache/c.py",
+            "python/.ruff_cache/r.py",
+            "python/.pytest_cache/p.py",
+            ".git/hooks/h.py",
+        ]:
+            path = base / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("")
+        found = [p.relative_to(base).as_posix()
+                 for p in self.checks.iter_files(base, (".py",))]
+        self.assertEqual(found, [
+            "python/internal-services/a/src/handler.py",
+            "python/internal-services/a/src/service/main.py",
+        ])
+        todos = [p.relative_to(base).as_posix()
+                 for p in self.checks.iter_files(base)]
+        self.assertIn("python/internal-services/a/events/a.json", todos)
+        self.assertEqual(len(todos), 3)
+
+    def test_iter_files_no_sigue_enlaces(self):
+        base = self.root / "projects" / "demo"
+        base.mkdir(parents=True)
+        outside = self.root / "afuera"
+        outside.mkdir()
+        (outside / "secreto.py").write_text("")
+        try:
+            (base / "enlace").symlink_to(outside, target_is_directory=True)
+            (base / "archivo.py").symlink_to(outside / "secreto.py")
+        except (OSError, NotImplementedError):
+            self.skipTest("este sistema no permite crear enlaces simbólicos")
+        self.assertEqual(list(self.checks.iter_files(base, (".py",))), [])

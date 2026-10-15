@@ -82,6 +82,12 @@ class Context:
     tracked: set[str] | None   # `git ls-files` relativo a la raíz; None si no es repo git
     quick: bool
 
+# recorrido común (ajuste del orquestador durante la ola 2): toda regla que
+# recorra archivos usa esto, que no entra a .venv, venv, node_modules, cdk.out,
+# .git ni cachés, y no sigue enlaces
+IGNORED_DIRS: frozenset[str]
+def iter_files(folder: Path, suffixes: tuple[str, ...] = ()) -> Iterator[Path]: ...
+
 # cada módulo de reglas, p. ej. checks/estructura.py:
 CATEGORY = "estructura"
 QUICK = True               # False solo en calidad

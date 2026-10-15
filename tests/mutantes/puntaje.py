@@ -51,4 +51,10 @@ MUTANTES = [
        "        findings=findings,")]),
     ("el JSON no trae el semáforo",
      [('            "semaphore": self.semaphore,\n', "")]),
+    ("iter_files entra a .venv y node_modules",
+     [("if d not in IGNORED_DIRS)", "if True)")]),
+    ("iter_files sigue enlaces a archivos",
+     [("            if path.is_symlink():\n                continue\n", "")]),
+    ("iter_files ignora el filtro de extensión",
+     [("            if suffixes and not name.endswith(suffixes):\n                continue\n", "")]),
 ]
