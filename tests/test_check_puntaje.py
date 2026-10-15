@@ -514,6 +514,11 @@ class SalidaTest(CheckTestCase):
         shutil.copytree(
             SCRIPT.parent, scripts, ignore=shutil.ignore_patterns("__pycache__")
         )
+        # Solo la regla falsa: el test no puede depender de las reglas reales
+        # (con ellas, este proyecto mínimo no sacaría 100).
+        for rule in (scripts / "checks").glob("*.py"):
+            if rule.name != "__init__.py":
+                rule.unlink()
         (scripts / "checks" / "zz_regla_falsa.py").write_text(
             "from checks import CheckResult\n"
             "CATEGORY = 'estructura'\n"
