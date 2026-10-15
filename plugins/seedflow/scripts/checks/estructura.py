@@ -13,10 +13,11 @@
 | E7    | El stack de CDK no se llama IacStack                    | No      |
 | E8    | Los nombres cumplen las reglas de seedflow              | No      |
 
-run() solo lee, y nunca a través de enlaces: un archivo enlazado (o dentro de
-una carpeta enlazada) no se lee ni se califica. Los arreglos (FIXES) escriben
-solo el archivo de su arreglo, nunca a través de enlaces, y no hacen nada si
-ya está arreglado.
+run() solo lee, y nunca a través de enlaces: lo que está detrás de un enlace
+(un archivo o una carpeta enlazada, o algo dentro de ella) no es parte del
+repo, así que no se mira ni descuenta; se avisa con un hallazgo de 0 puntos.
+Los arreglos (FIXES) escriben solo el archivo de su arreglo, nunca a través
+de enlaces, y no hacen nada si ya está arreglado.
 """
 
 from __future__ import annotations
@@ -130,6 +131,7 @@ def project_findings(root: Path, project: Project) -> Iterator[Finding]:
     yield from name_findings(root, project)
     yield from folder_findings(root, project)
     yield from iac_findings(root, project)
+    yield from services_findings(root, project)
     for microservice in project.microservices:
         yield from microservice_findings(root, project, microservice)
     yield from launch_findings(root, project)
@@ -197,7 +199,9 @@ def folder_findings(root: Path, project: Project) -> Iterator[Finding]:
     """E1: las tres carpetas del proyecto."""
     for folder in PROJECT_FOLDERS:
         path = project.path / folder
-        if not path.is_dir():
+        if seedflow.is_link(path):
+            yield link_notice(root, project, "E1", path)
+        elif not path.is_dir():
             yield found(
                 root,
                 project,
@@ -212,6 +216,8 @@ def folder_findings(root: Path, project: Project) -> Iterator[Finding]:
 def iac_findings(root: Path, project: Project) -> Iterator[Finding]:
     """E6 y E7: repo git anidado y stack IacStack."""
     iac = project.path / "iac"
+    if seedflow.is_link(iac):
+        return  # E1 avisa que es un enlace
     nested = iac / ".git"
     if os.path.lexists(nested):
         yield found(
@@ -223,6 +229,8 @@ def iac_findings(root: Path, project: Project) -> Iterator[Finding]:
             "Muévelo a un respaldo fuera del repo, o bórralo si no necesitas "
             "ese historial; seedflow no lo borra solo porque se perdería.",
         )
+    for link in iac_links(iac):
+        yield link_notice(root, project, "E7", link)
     stack = iac_stack_file(project.path, iac)
     if stack is not None:
         yield found(
@@ -255,6 +263,19 @@ def iac_stack_file(base: Path, iac: Path) -> Path | None:
     return None
 
 
+def iac_links(iac: Path) -> Iterator[Path]:
+    """Enlaces donde estaría el stack: iac/bin, iac/lib o sus archivos."""
+    for folder in ("bin", "lib"):
+        path = iac / folder
+        if seedflow.is_link(path):
+            yield path
+        elif path.is_dir():
+            for item in sorted(path.iterdir()):
+                linked = seedflow.is_link(item)
+                if linked and is_stack_file((folder, item.name)):
+                    yield item
+
+
 def is_stack_file(parts: tuple[str, ...]) -> bool:
     """bin/<algo>.ts o lib/<algo>-stack.ts, sin bajar más."""
     if len(parts) != 2:
@@ -265,14 +286,35 @@ def is_stack_file(parts: tuple[str, ...]) -> bool:
     return folder == "lib" and name.endswith("-stack.ts")
 
 
-def through_link(base: Path, path: Path) -> bool:
-    """Si path, o alguna carpeta entre base y path, es un enlace."""
+def first_link(base: Path, path: Path) -> Path | None:
+    """El primer tramo entre base (sin incluirla) y path que es un enlace."""
     current = base
     for part in path.relative_to(base).parts:
         current = current / part
         if seedflow.is_link(current):
-            return True
-    return False
+            return current
+    return None
+
+
+def through_link(base: Path, path: Path) -> bool:
+    """Si path, o alguna carpeta entre base y path, es un enlace."""
+    return first_link(base, path) is not None
+
+
+def link_notice(root: Path, project: Project, rule: str, path: Path) -> Finding:
+    """Aviso de 0 puntos: path es un enlace y no se revisó lo de detrás."""
+    relative = path.relative_to(project.path).as_posix()
+    return found(
+        root,
+        project,
+        rule,
+        path,
+        f"{relative} es un enlace: lo que hay detrás no es parte del repo, "
+        "así que no se revisó y no descuenta.",
+        "Reemplaza el enlace por la carpeta o el archivo real para que "
+        "seedflow lo revise, o revísalo a mano.",
+        points=0,
+    )
 
 
 def read(base: Path, path: Path) -> bytes:
@@ -292,43 +334,8 @@ def microservice_findings(
     root: Path, project: Project, microservice: Microservice
 ) -> Iterator[Finding]:
     """E2, E3 y E5: lo que tiene que tener cada microservicio."""
-    for part, is_folder in MICROSERVICE_PARTS:
-        path = microservice.path / part
-        if not (path.is_dir() if is_folder else path.is_file()):
-            kind = "la carpeta" if is_folder else "el archivo"
-            yield found(
-                root,
-                project,
-                "E2",
-                path,
-                f"Al microservicio {microservice.name} le falta {kind} {part}.",
-                f"Créalo como en un microservicio nuevo de seedflow (ver "
-                f"{STANDARD}).",
-            )
-    events = microservice.path / "events"
-    event = events / f"{microservice.name}.json"
-    if events.is_dir() and not event.exists():
-        yield found(
-            root,
-            project,
-            "E3",
-            event,
-            f"Falta el evento de prueba events/{microservice.name}.json.",
-            "Crea el archivo con {} y completa el evento que recibe la Lambda.",
-            fix_id_for(
-                "E3", project.name, microservice.service_type, microservice.name
-            ),
-        )
-    elif events.is_dir() and not event.is_file():
-        yield found(
-            root,
-            project,
-            "E3",
-            event,
-            f"events/{microservice.name}.json es una carpeta, no un archivo.",
-            "Mueve lo que tenga esa carpeta y crea en su lugar el archivo del "
-            "evento (seedflow no la borra).",
-        )
+    yield from parts_findings(root, project, microservice)
+    yield from event_findings(root, project, microservice)
     handler = microservice.path / "src" / "handler.py"
     if BROKEN_EVENTS in read(microservice.path, handler):
         yield found(
@@ -342,6 +349,80 @@ def microservice_findings(
                 "E5", project.name, microservice.service_type, microservice.name
             ),
         )
+
+
+def parts_findings(
+    root: Path, project: Project, microservice: Microservice
+) -> Iterator[Finding]:
+    """E2: carpetas y archivos del microservicio (un aviso por enlace)."""
+    noticed: set[Path] = set()
+    for part, is_folder in MICROSERVICE_PARTS:
+        path = microservice.path / part
+        link = first_link(microservice.path, path)
+        if link is not None:
+            if link not in noticed:
+                noticed.add(link)
+                yield link_notice(root, project, "E2", link)
+        elif not (path.is_dir() if is_folder else path.is_file()):
+            kind = "la carpeta" if is_folder else "el archivo"
+            yield found(
+                root,
+                project,
+                "E2",
+                path,
+                f"Al microservicio {microservice.name} le falta {kind} {part}.",
+                f"Créalo como en un microservicio nuevo de seedflow (ver "
+                f"{STANDARD}).",
+            )
+
+
+def event_findings(
+    root: Path, project: Project, microservice: Microservice
+) -> Iterator[Finding]:
+    """E3: el evento de prueba (si events/ es un enlace, ya avisó E2)."""
+    events = microservice.path / "events"
+    event = events / f"{microservice.name}.json"
+    if through_link(microservice.path, events) or not events.is_dir():
+        return
+    if seedflow.is_link(event):
+        yield link_notice(root, project, "E3", event)
+    elif not event.exists():
+        yield found(
+            root,
+            project,
+            "E3",
+            event,
+            f"Falta el evento de prueba events/{microservice.name}.json.",
+            "Crea el archivo con {} y completa el evento que recibe la Lambda.",
+            fix_id_for(
+                "E3", project.name, microservice.service_type, microservice.name
+            ),
+        )
+    elif not event.is_file():
+        yield found(
+            root,
+            project,
+            "E3",
+            event,
+            f"events/{microservice.name}.json es una carpeta, no un archivo.",
+            "Mueve lo que tenga esa carpeta y crea en su lugar el archivo del "
+            "evento (seedflow no la borra).",
+        )
+
+
+def services_findings(root: Path, project: Project) -> Iterator[Finding]:
+    """E2: carpetas de servicios o microservicios que son enlaces."""
+    python = project.path / "python"
+    if seedflow.is_link(python):
+        return  # E1 avisa que es un enlace
+    for service_type in seedflow.SERVICE_TYPES:
+        folder = python / service_type
+        if seedflow.is_link(folder):
+            yield link_notice(root, project, "E2", folder)
+        elif folder.is_dir():
+            for item in sorted(folder.iterdir()):
+                if seedflow.is_link(item):
+                    yield link_notice(root, project, "E2", item)
 
 
 def launch_entries(data: dict) -> set[tuple[str, str]]:
@@ -363,7 +444,10 @@ def launch_findings(root: Path, project: Project) -> Iterator[Finding]:
     Si launch.json tiene comentarios u otra forma, la regla no se evalúa en
     ese proyecto: no descuenta (las demás reglas sí).
     """
-    path = project.path / "python" / ".vscode" / "launch.json"
+    python = project.path / "python"
+    if seedflow.is_link(python):
+        return  # E1 avisa que es un enlace
+    path = python / ".vscode" / "launch.json"
     if through_link(project.path, path):
         yield launch_not_evaluated(
             root,
@@ -395,6 +479,8 @@ def launch_findings(root: Path, project: Project) -> Iterator[Finding]:
             fix_id_for("E4", project.name, service_type, name),
         )
     for service_type, name in sorted(entries - existing):
+        if through_link(project.path, python / service_type / name):
+            continue  # es un enlace: services_findings ya avisó
         yield found(
             root,
             project,

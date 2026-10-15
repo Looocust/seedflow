@@ -432,40 +432,143 @@ class EnlacesYCarpetasTest(EstructuraTestCase):
             self.fix("E3:demo/internal-services/orders")
         self.assertEqual((event / "algo.txt").read_text(), "mío")
 
-    @unittest.skipIf(os.name == "nt", "enlaces simbólicos en Windows")
-    def test_handler_enlazado_no_se_lee(self):
-        afuera = self.base / "afuera"
-        (afuera / "src" / "service").mkdir(parents=True)
-        for folder in (afuera, afuera / "src"):
-            (folder / "handler.py").write_text(OLD_HANDLER)
-        handler = self.path(f"{ORDERS}/src/handler.py")
-        handler.unlink()
-        self.link(handler, afuera / "handler.py")
-        with self.subTest(enlace="src/handler.py"):
-            self.assertEqual(self.findings("E5"), [])
-        src = handler.parent
-        shutil.rmtree(src)
-        self.link(src, afuera / "src")
-        with self.subTest(enlace="src/"):
-            self.assertEqual(self.findings("E5"), [])
+@unittest.skipIf(os.name == "nt", "enlaces simbólicos en Windows")
+class EnlacesTest(EstructuraTestCase):
+    """Lo que está detrás de un enlace no se revisa ni descuenta: se avisa."""
 
-    @unittest.skipIf(os.name == "nt", "enlaces simbólicos en Windows")
+    def setUp(self):
+        super().setUp()
+        self.afuera = self.base / "afuera"
+        self.afuera.mkdir()
+
+    def assert_only_notices(self, *expected):
+        """Los hallazgos son exactamente estos avisos de 0 puntos."""
+        found = self.findings()
+        self.assertEqual(
+            sorted((f["rule"], f["path"]) for f in found), sorted(expected)
+        )
+        for finding in found:
+            self.assert_finding(finding, finding["rule"], 0, finding["path"])
+            self.assertIn("enlace", finding["message"])
+            self.assertIn("no se revis", finding["message"])
+        self.assertEqual(self.score(), 100)
+
+    def replace_with_link(self, relative, target):
+        path = self.path(relative)
+        if path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+        self.link(path, target)
+
+    def test_events_enlazada_no_se_revisa(self):
+        # Afuera no está orders.json: si se mirara, E3 descontaría 3.
+        self.replace_with_link(f"{ORDERS}/events", self.afuera)
+        self.assert_only_notices(("E2", f"{ORDERS}/events"))
+        with self.assertRaises(self.seed_error()):
+            self.fix("E3:demo/internal-services/orders")
+        self.assertEqual(list(self.afuera.iterdir()), [])
+
+    def test_evento_enlazado_no_se_revisa(self):
+        (self.afuera / "evento.json").write_text("{}")
+        for target in [self.afuera / "evento.json", self.afuera / "no-existe"]:
+            with self.subTest(destino=target.name):
+                self.replace_with_link(f"{ORDERS}/events/orders.json", target)
+                self.assert_only_notices(
+                    ("E3", f"{ORDERS}/events/orders.json")
+                )
+
+    def test_layers_enlazado_no_se_revisa(self):
+        (self.afuera / "layers").mkdir()  # sin requirements.txt
+        self.replace_with_link(f"{ORDERS}/layers/requirements.txt",
+                               self.afuera / "no-existe.txt")
+        self.assert_only_notices(("E2", f"{ORDERS}/layers/requirements.txt"))
+        self.replace_with_link(f"{ORDERS}/layers", self.afuera / "layers")
+        self.assert_only_notices(("E2", f"{ORDERS}/layers"))
+
+    def test_handler_enlazado_no_se_lee(self):
+        (self.afuera / "src").mkdir()  # sin service/
+        for folder in (self.afuera, self.afuera / "src"):
+            (folder / "handler.py").write_text(OLD_HANDLER)
+        self.replace_with_link(f"{ORDERS}/src/handler.py",
+                               self.afuera / "handler.py")
+        with self.subTest(enlace="src/handler.py"):
+            self.assert_only_notices(("E2", f"{ORDERS}/src/handler.py"))
+        self.replace_with_link(f"{ORDERS}/src", self.afuera / "src")
+        with self.subTest(enlace="src/"):
+            # Un solo aviso por la carpeta, aunque falte service/ afuera.
+            self.assert_only_notices(("E2", f"{ORDERS}/src"))
+
+    def test_iac_enlazada_a_un_repo_con_git_no_se_revisa(self):
+        (self.afuera / ".git").mkdir()
+        (self.afuera / "lib").mkdir()
+        (self.afuera / "lib" / "iac-stack.ts").write_text(
+            "export class IacStack extends cdk.Stack {}\n"
+        )
+        self.replace_with_link("projects/demo/iac", self.afuera)
+        self.assert_only_notices(("E1", "projects/demo/iac"))
+
     def test_iacstack_enlazado_no_se_lee(self):
-        afuera = self.base / "afuera"
-        (afuera / "lib").mkdir(parents=True)
-        for path in (afuera / "iac.ts", afuera / "lib" / "iac-stack.ts"):
+        (self.afuera / "lib").mkdir()
+        for path in (self.afuera / "iac.ts",
+                     self.afuera / "lib" / "iac-stack.ts"):
             path.write_text("export class IacStack extends cdk.Stack {}\n")
         iac = self.path("projects/demo/iac")
         (iac / "bin").mkdir()
-        self.link(iac / "bin" / "iac.ts", afuera / "iac.ts")
-        self.link(iac / "lib", afuera / "lib")
-        # Más abajo de lib/ tampoco se mira.
+        (iac / "lib").mkdir()
+        self.link(iac / "bin" / "iac.ts", self.afuera / "iac.ts")
+        self.link(iac / "lib" / "iac-stack.ts",
+                  self.afuera / "lib" / "iac-stack.ts")
+        # Un enlace que no es un archivo del stack no se menciona.
+        self.link(iac / "lib" / "otro.ts", self.afuera / "iac.ts")
+        # Más abajo de bin/ tampoco se mira.
         (iac / "bin" / "sub").mkdir()
         (iac / "bin" / "sub" / "iac.ts").write_text("new IacStack();\n")
-        self.assertEqual(self.findings("E7"), [])
-        shutil.rmtree(iac)
-        self.link(iac, afuera)
-        self.assertEqual(self.findings("E7"), [])
+        self.assert_only_notices(
+            ("E7", "projects/demo/iac/bin/iac.ts"),
+            ("E7", "projects/demo/iac/lib/iac-stack.ts"),
+        )
+        shutil.rmtree(iac / "lib")
+        self.link(iac / "lib", self.afuera / "lib")
+        self.assert_only_notices(
+            ("E7", "projects/demo/iac/bin/iac.ts"),
+            ("E7", "projects/demo/iac/lib"),
+        )
+
+    def test_carpetas_del_proyecto_enlazadas_no_se_revisan(self):
+        (self.afuera / "scripts").mkdir()
+        self.replace_with_link("projects/demo/deployment-scripts",
+                               self.afuera / "scripts")
+        self.assert_only_notices(("E1", "projects/demo/deployment-scripts"))
+        # python/ afuera, con un launch.json que tiene una entrada huérfana:
+        # un solo aviso, sin el de launch.json ni la huérfana.
+        python = self.afuera / "python"
+        shutil.copytree(self.path("projects/demo/python"), python,
+                        symlinks=True)
+        data = json.loads((python / ".vscode" / "launch.json").read_text())
+        data["configurations"].append(
+            self.seedflow.microservice_launch_config("viejo", "internal-services")
+        )
+        (python / ".vscode" / "launch.json").write_text(json.dumps(data))
+        self.replace_with_link("projects/demo/python", python)
+        self.assert_only_notices(
+            ("E1", "projects/demo/deployment-scripts"),
+            ("E1", "projects/demo/python"),
+        )
+
+    def test_carpeta_de_servicios_enlazada_no_se_revisa(self):
+        services = "projects/demo/python/internal-services"
+        shutil.copytree(self.path(services), self.afuera / "services")
+        shutil.rmtree(self.afuera / "services" / "orders" / "events")
+        self.replace_with_link(services, self.afuera / "services")
+        # La entrada de orders en launch.json no cuenta como huérfana.
+        self.assert_only_notices(("E2", services))
+
+    def test_microservicio_enlazado_no_se_revisa(self):
+        self.create_microservice("viejo")
+        services = "projects/demo/python/internal-services"
+        self.replace_with_link(f"{services}/viejo", self.afuera)
+        self.assert_only_notices(("E2", f"{services}/viejo"))
 
 
 class LaunchTest(EstructuraTestCase):
