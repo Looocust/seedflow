@@ -1,9 +1,10 @@
 """Reglas de seguridad e higiene.
 
 - H1: un `.env` commiteado dentro de projects/ (crítico). Sin git no se
-  evalúa: fuera de un repo nada está commiteado.
-- H2: el `.gitignore` de la raíz no ignora `.env` (importante, en cada
-  proyecto). Es la única con arreglo mecánico (FIXES).
+  puede evaluar: lo avisa con un hallazgo de 0 puntos en cada proyecto.
+- H2: el `.gitignore` de la raíz no ignora el `python/.env` del proyecto
+  (importante). Mira solo ese archivo, nada de la configuración local. Es
+  la única con arreglo mecánico (FIXES).
 - H3: texto con forma de credencial en un `.py` (crítico).
 - H4: `read`, `execute_query` o `write` con una query armada con una
   f-string o `.format()` (importante).
@@ -19,6 +20,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 from collections.abc import Callable
 from collections.abc import Iterator
 from pathlib import Path
@@ -41,14 +43,20 @@ FALSE_POSITIVE = "puede ser un falso positivo"
 AWS_KEY = re.compile(r"(?<![0-9A-Z])AKIA[0-9A-Z]{16}(?![0-9A-Z])")
 SECRET_NAME = re.compile(r"(password|secret|token)$", re.IGNORECASE)
 QUERY_METHODS = {"read", "execute_query", "write"}
+# Un aviso (regla sin evaluar) no descuenta.
+POINTS = {**SEVERITY, "aviso": 0}
+# Variables que harían que git mire otro repo en lugar del temporal.
+GIT_LOCATION_VARIABLES = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE")
 
 
 def run(ctx: Context) -> CheckResult:
     """Corre las cuatro reglas sobre cada proyecto."""
-    exposed = exposed_projects(ctx)
+    exposed = exposed_projects(ctx.root, [p.name for p in ctx.projects])
     env_files = committed_env_files(ctx.tracked)
     findings: list[Finding] = []
     for project in ctx.projects:
+        if ctx.tracked is None:
+            findings.append(committed_env_not_evaluated(project))
         findings.extend(committed_env(project, env_files))
         if project.name in exposed:
             findings.append(gitignore_finding(project))
@@ -69,7 +77,7 @@ def finding(
     return Finding(
         category=CATEGORY,
         rule=rule,
-        points=SEVERITY[severity],
+        points=POINTS[severity],
         project=project.name,
         path=path,
         message=message,
@@ -82,6 +90,24 @@ def finding(
 # --------------------------------------------------------------------------
 # H1: .env commiteado
 # --------------------------------------------------------------------------
+
+
+def committed_env_not_evaluated(project: Project) -> Finding:
+    """Aviso de 0 puntos: sin git no se sabe si hay un .env commiteado."""
+    return finding(
+        "H1",
+        "aviso",
+        project,
+        f"projects/{project.name}",
+        (
+            "Sin revisar si hay un .env commiteado: no se pudo evaluar "
+            "porque la carpeta no es un repo git (o git no está instalado).",
+            "Un .env commiteado deja sus credenciales a la vista de "
+            "cualquiera con acceso al repo.",
+            f"Revísalo a mano en el repo: git ls-files projects/{project.name}"
+            " | grep '/\\.env$' no debe mostrar nada.",
+        ),
+    )
 
 
 def committed_env_files(tracked: set[str] | None) -> list[str]:
@@ -119,72 +145,111 @@ def committed_env(project: Project, env_files: list[str]) -> list[Finding]:
 # --------------------------------------------------------------------------
 
 
-def exposed_projects(ctx: Context) -> set[str]:
-    """Los proyectos en los que un `python/.env` no quedaría ignorado.
+def exposed_projects(root: Path, names: list[str]) -> set[str]:
+    """Los proyectos cuyo `python/.env` no ignora el .gitignore de la raíz.
 
-    En un repo git se lo pregunta a git (entiende todos sus patrones), sin la
-    configuración global de quien califica: la nota no puede depender de la
-    máquina. Fuera de git, o si git falla, mira las líneas del `.gitignore`.
+    Solo cuentan los patrones de ese archivo, que es el que se commitea: ni
+    .gitignore de proyectos, ni .git/info/exclude, ni el gitignore global de
+    quien califica. Así dos copias iguales del repo sacan la misma nota. Con
+    git los entiende todos (negaciones, **, rutas); sin git, líneas exactas.
     """
-    names = {project.name for project in ctx.projects}
-    if ctx.tracked is not None:
-        ignored = git_ignored_projects(ctx)
-        if ignored is not None:
-            return names - ignored
-    if gitignore_lines_ignore_env(ctx.root / GITIGNORE):
-        return set()
-    return names
+    patterns = read_gitignore(root)
+    ignored = git_ignored(patterns, [env_path(name) for name in names])
+    if ignored is None:
+        return set() if lines_ignore_env(patterns) else set(names)
+    return {name for name in names if env_path(name) not in ignored}
 
 
-def env_path(project: Project) -> str:
+def env_path(project: str) -> str:
     """Dónde va el .env de un proyecto, relativo a la raíz."""
-    return f"projects/{project.name}/python/.env"
+    return f"projects/{project}/python/.env"
 
 
-def git_ignored_projects(ctx: Context) -> set[str] | None:
-    """Proyectos cuyo .env ignora git (None si no se le pudo preguntar)."""
-    git = shutil.which("git")
+def read_gitignore(root: Path) -> bytes:
+    """El .gitignore de la raíz (git no lee uno que sea un enlace)."""
+    gitignore = root / GITIGNORE
+    if gitignore.is_symlink() or not gitignore.is_file():
+        return b""
+    return gitignore.read_bytes()
+
+
+def git_executable() -> str | None:
+    """Ruta de git, o None si no está instalado."""
+    return shutil.which("git")
+
+
+def git_ignored(patterns: bytes, paths: list[str]) -> set[str] | None:
+    """Cuáles de paths ignoran estos patrones, según git (None sin git).
+
+    Los evalúa en un repo temporal vacío, fuera del repo calificado, donde
+    ese .gitignore es lo único que hay.
+    """
+    git = git_executable()
     if not git:
         return None
-    paths = [env_path(project) for project in ctx.projects]
+    env = {
+        k: v for k, v in os.environ.items() if k not in GIT_LOCATION_VARIABLES
+    }
     try:
-        result = subprocess.run(
-            [
-                git,
-                "-c",
-                "core.excludesFile=",
-                "check-ignore",
-                "--no-index",
-                "--stdin",
-                "-z",
-            ],
-            cwd=ctx.root,
-            input="\0".join(paths).encode("utf-8"),
-            capture_output=True,
-            check=False,
-            timeout=30,
-        )
+        with tempfile.TemporaryDirectory(prefix="seedflow-gitignore-") as temp:
+            folder = Path(temp)
+            subprocess.run(
+                [git, "init", "-q", str(folder)],
+                env=env,
+                capture_output=True,
+                check=True,
+                timeout=30,
+            )
+            # Una plantilla de git init podría traer exclusiones propias.
+            (folder / ".git" / "info").mkdir(parents=True, exist_ok=True)
+            (folder / ".git" / "info" / "exclude").write_bytes(b"")
+            (folder / GITIGNORE).write_bytes(patterns)
+            result = subprocess.run(
+                [
+                    git,
+                    "-c",
+                    "core.excludesFile=",
+                    "check-ignore",
+                    "--no-index",
+                    "--stdin",
+                    "-z",
+                ],
+                cwd=folder,
+                env=env,
+                input="\0".join(paths).encode("utf-8"),
+                capture_output=True,
+                check=False,
+                timeout=30,
+            )
     except (subprocess.SubprocessError, OSError):
         return None
     if result.returncode not in (0, 1):
         return None
-    ignored = {os.fsdecode(p) for p in result.stdout.split(b"\0") if p}
-    return {p.name for p in ctx.projects if env_path(p) in ignored}
+    return {os.fsdecode(p) for p in result.stdout.split(b"\0") if p}
 
 
-def gitignore_lines_ignore_env(gitignore: Path) -> bool:
+def lines_ignore_env(patterns: bytes) -> bool:
     """Sin git: una línea exacta `.env` o `*.env` (la última decide)."""
-    if not gitignore.is_file():
-        return False
     ignored = False
-    lines = gitignore.read_text(encoding="utf-8", errors="replace")
-    for line in lines.splitlines():
+    for line in patterns.decode("utf-8", errors="replace").splitlines():
         pattern = line.rstrip()
         if pattern in (".env", "*.env"):
             ignored = True
         elif pattern in ("!.env", "!*.env"):
             ignored = False
     return ignored
+
+
+def project_names(root: Path) -> list[str]:
+    """Las carpetas de projects/, sin enlaces (para el arreglo)."""
+    folder = root / "projects"
+    if folder.is_symlink() or not folder.is_dir():
+        return []
+    return sorted(
+        item.name
+        for item in folder.iterdir()
+        if item.is_dir() and not item.is_symlink()
+    )
 
 
 def gitignore_finding(project: Project) -> Finding:
@@ -195,9 +260,10 @@ def gitignore_finding(project: Project) -> Finding:
         project,
         GITIGNORE,
         (
-            "El .gitignore de la raíz no ignora .env.",
+            "El .gitignore de la raíz no ignora el .env de este proyecto "
+            "(python/.env).",
             "Un .env con credenciales se puede commitear sin que nadie lo "
-            "note, en este proyecto y en todos los del repo.",
+            "note.",
             "Agrega la línea .env al .gitignore de la raíz.",
         ),
         fix_id=GITIGNORE_FIX,
@@ -207,8 +273,9 @@ def gitignore_finding(project: Project) -> Finding:
 def add_env_to_gitignore(root: Path, fix_id: str) -> list[Path]:
     """Agrega `.env` al final del `.gitignore` de la raíz (lo crea si falta).
 
-    No toca las demás líneas. Devuelve los archivos que cambió: ninguno si
-    ya ignoraba `.env`. No escribe a través de un enlace simbólico.
+    Decide con el mismo detector que H2: si ningún proyecto queda expuesto
+    no cambia nada. No toca las demás líneas, devuelve los archivos que
+    cambió y no escribe a través de un enlace simbólico.
     """
     gitignore = root / GITIGNORE
     if gitignore.is_symlink():
@@ -216,7 +283,7 @@ def add_env_to_gitignore(root: Path, fix_id: str) -> list[Path]:
             f"{gitignore} es un enlace simbólico; seedflow no escribe a "
             "través de enlaces. Agrega la línea .env a mano."
         )
-    if gitignore_lines_ignore_env(gitignore):
+    if not exposed_projects(root, project_names(root)):
         return []
     data = gitignore.read_bytes() if gitignore.exists() else b""
     newline = b"\r\n" if b"\r\n" in data else b"\n"
@@ -294,7 +361,7 @@ def secret_lines(tree: ast.AST | None) -> Iterator[int]:
                 and SECRET_NAME.search(name)
                 and isinstance(value, ast.Constant)
                 and isinstance(value.value, str)
-                and value.value.strip()
+                and value.value
             ):
                 yield value.lineno
 

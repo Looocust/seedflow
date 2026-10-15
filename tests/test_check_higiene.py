@@ -90,12 +90,16 @@ class HigieneTestCase(unittest.TestCase):
         return code, out.getvalue(), err.getvalue()
 
     def check(self):
-        """(reporte JSON, hallazgos de higiene) de check con las reglas reales."""
+        """(reporte JSON, hallazgos de higiene) de check con las reglas reales.
+
+        Los avisos de H1 sin evaluar (0 puntos) quedan aparte, en self.avisos.
+        """
         code, out, err = self.run_cli("check", "--json")
         self.assertEqual(code, 0, out + err)
         report = json.loads(out)
-        findings = [f for f in report["findings"] if f["category"] == "higiene"]
-        return report, findings
+        higiene = [f for f in report["findings"] if f["category"] == "higiene"]
+        self.avisos = [f for f in higiene if f["points"] == 0]
+        return report, [f for f in higiene if f["points"] != 0]
 
     def score(self, report, project="demo"):
         """Nota de higiene de un proyecto (None si no se evaluó)."""
@@ -130,6 +134,30 @@ class HigieneTestCase(unittest.TestCase):
     def rules(self, findings, rule):
         return [f for f in findings if f["rule"] == rule]
 
+    def without_git(self):
+        """Como si git no estuviera instalado (solo para estas reglas)."""
+        patcher = mock.patch.object(
+            self.higiene(), "git_executable", return_value=None
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def prepare(self, modo, gitignore):
+        """La raíz en uno de MODOS, con este .gitignore (None: sin él)."""
+        if modo == "repo git":
+            self.git_repo(gitignore)
+            return
+        if gitignore is not None:
+            self.write(".gitignore", gitignore)
+        if modo == "git no instalado":
+            self.without_git()
+
+
+# Cómo puede estar la raíz: H2 no depende de que sea un repo git (lee solo el
+# .gitignore de la raíz); sin git instalado usa las líneas exactas.
+MODOS = ("repo git", "carpeta sin git", "git no instalado")
+MODOS_CON_GIT = ("repo git", "carpeta sin git")
+
 
 class ProyectoNuevoTest(HigieneTestCase):
     def test_proyecto_nuevo_con_gitignore_correcto_no_tiene_hallazgos(self):
@@ -150,6 +178,7 @@ class ProyectoNuevoTest(HigieneTestCase):
         self.git("add", "-A")
         report, findings = self.check()
         self.assertEqual(findings, [])
+        self.assertEqual(self.avisos, [])
         self.assertEqual(self.score(report, "demo"), 100)
         self.assertEqual(self.score(report, "solo"), 100)
 
@@ -190,16 +219,28 @@ class EnvCommiteadoTest(HigieneTestCase):
         self.assertEqual(self.score(report), 100)
 
     def test_fuera_de_git_no_se_evalua_env_commiteado(self):
-        # Sin git nada está commiteado: la regla no descuenta, y el resto de
-        # la categoría sí se evalúa.
-        self.make_projects("demo")
+        # Sin git la regla no se puede evaluar: lo avisa con un hallazgo de 0
+        # puntos por proyecto, y el resto de la categoría sí se evalúa.
+        self.make_projects("demo", "otro")
         self.write("projects/demo/python/.env", "X=1\n")
         self.write(".gitignore", ".env\n")
         report, findings = self.check()
         self.assertEqual(findings, [])
+        self.assertEqual(
+            [(f["rule"], f["project"], f["path"], f["points"], f["fix_id"])
+             for f in self.avisos],
+            [("H1", "demo", "projects/demo", 0, None),
+             ("H1", "otro", "projects/otro", 0, None)],
+        )
+        for aviso in self.avisos:
+            self.assertIn("no se pudo evaluar", aviso["message"])
+            self.assertIn("no es un repo git", aviso["message"])
+            self.assertIn("git ls-files", aviso["how"])
+            self.assertTrue(aviso["why"])
         self.assertEqual(self.score(report), 100)
-        demo = report["projects"][0]
-        self.assertNotIn("higiene", demo["not_evaluated"])
+        self.assertEqual(self.score(report, "otro"), 100)
+        for project in report["projects"]:
+            self.assertNotIn("higiene", project["not_evaluated"])
 
 
 class GitignoreTest(HigieneTestCase):
@@ -223,14 +264,11 @@ class GitignoreTest(HigieneTestCase):
             "ignorado y después des-ignorado": ".env\n!.env\n",
         }
         for caso, gitignore in casos.items():
-            for con_git in [True, False]:
-                with self.subTest(caso=caso, git=con_git):
+            for modo in MODOS:
+                with self.subTest(caso=caso, modo=modo):
                     self.setUp()
                     self.make_projects("demo", "otro")
-                    if con_git:
-                        self.git_repo(gitignore)
-                    elif gitignore is not None:
-                        self.write(".gitignore", gitignore)
+                    self.prepare(modo, gitignore)
                     report, findings = self.check()
                     self.assert_h2_en_cada_proyecto(findings)
                     self.assertEqual(len(findings), 2)
@@ -239,54 +277,91 @@ class GitignoreTest(HigieneTestCase):
 
     def test_gitignore_que_ignora_env_no_descuenta(self):
         for gitignore in [".env\n", "*.env\n", ".env  \n", "# x\r\n.env\r\n"]:
-            for con_git in [True, False]:
-                with self.subTest(gitignore=gitignore, git=con_git):
+            for modo in MODOS:
+                with self.subTest(gitignore=gitignore, modo=modo):
                     self.setUp()
                     self.make_projects("demo")
-                    if con_git:
-                        self.git_repo(gitignore)
-                    else:
-                        self.write(".gitignore", gitignore)
+                    self.prepare(modo, gitignore)
                     report, findings = self.check()
                     self.assertEqual(findings, [])
                     self.assertEqual(self.score(report), 100)
 
     def test_con_git_entiende_los_patrones_de_git(self):
-        # Patrones que solo git sabe leer, y un .gitignore del proyecto.
-        for archivos in [
-            {".gitignore": "**/.env\n"},
-            {".gitignore": ".env*\n!.env.example\n"},
-            {".gitignore": "node_modules/\n",
-             "projects/demo/.gitignore": ".env\n"},
-        ]:
-            with self.subTest(archivos=archivos):
-                self.setUp()
-                self.make_projects("demo")
-                for relative, content in archivos.items():
-                    self.write(relative, content)
-                self.git_repo(None)
-                report, findings = self.check()
-                self.assertEqual(findings, [])
-                self.assertEqual(self.score(report), 100)
+        # Patrones del .gitignore de la raíz que solo git sabe leer.
+        for gitignore in ["**/.env\n", ".env*\n!.env.example\n",
+                          "projects/*/python/.env\n"]:
+            for modo in MODOS_CON_GIT:
+                with self.subTest(gitignore=gitignore, modo=modo):
+                    self.setUp()
+                    self.make_projects("demo")
+                    self.prepare(modo, gitignore)
+                    report, findings = self.check()
+                    self.assertEqual(findings, [])
+                    self.assertEqual(self.score(report), 100)
 
-    def test_con_git_un_gitignore_del_proyecto_protege_solo_a_ese(self):
+    def test_con_git_una_proteccion_limitada_a_una_ruta(self):
+        # Lo que protege a un proyecto no protege a los demás, y lo que
+        # des-ignora un proyecto lo deja expuesto solo a él.
+        for gitignore, expuesto in [
+            ("projects/demo/python/.env\n", "otro"),
+            (".env\n!projects/demo/python/.env\n", "demo"),
+        ]:
+            for modo in MODOS_CON_GIT:
+                with self.subTest(gitignore=gitignore, modo=modo):
+                    self.setUp()
+                    self.make_projects("demo", "otro")
+                    self.prepare(modo, gitignore)
+                    report, findings = self.check()
+                    self.assertEqual(
+                        [(f["rule"], f["project"]) for f in findings],
+                        [("H2", expuesto)],
+                    )
+                    self.assertEqual(self.score(report, expuesto), 90)
+
+    def test_solo_cuenta_el_gitignore_de_la_raiz(self):
+        # Un .gitignore del proyecto o .git/info/exclude (que no se commitea)
+        # no protegen: H2 mira solo el .gitignore de la raíz, así dos copias
+        # iguales del repo sacan la misma nota.
+        self.make_projects("demo", "otro")
+        self.write("projects/demo/.gitignore", ".env\n")
+        self.write("projects/otro/python/.gitignore", ".env\n")
+        self.git_repo("node_modules/\n")
+        exclude = self.root / ".git" / "info" / "exclude"
+        exclude.parent.mkdir(parents=True, exist_ok=True)
+        exclude.write_text(".env\n")
+        _, findings = self.check()
+        self.assert_h2_en_cada_proyecto(findings)
+
+    def test_variables_de_git_del_entorno_no_cambian_el_resultado(self):
+        # Si seedflow corre dentro de un hook de git (GIT_DIR y GIT_WORK_TREE
+        # apuntan al repo), H2 igual mira solo el .gitignore de la raíz.
         self.make_projects("demo", "otro")
         self.write("projects/demo/.gitignore", ".env\n")
         self.git_repo("node_modules/\n")
-        report, findings = self.check()
-        self.assertEqual(
-            [(f["rule"], f["project"]) for f in findings], [("H2", "otro")]
-        )
-        self.assertEqual(self.score(report, "demo"), 100)
-        self.assertEqual(self.score(report, "otro"), 90)
+        git_dir = self.root / ".git"
+        before = sorted(p.relative_to(git_dir).as_posix()
+                        for p in git_dir.rglob("*"))
+        with mock.patch.dict(os.environ, {
+            "GIT_DIR": str(git_dir), "GIT_WORK_TREE": str(self.root),
+        }):
+            _, findings = self.check()
+        self.assert_h2_en_cada_proyecto(findings)
+        after = sorted(p.relative_to(git_dir).as_posix()
+                       for p in git_dir.rglob("*"))
+        self.assertEqual(after, before)
 
     def test_el_gitignore_global_del_usuario_no_cuenta(self):
         # Dos personas con la misma copia del repo tienen que ver la misma
         # nota: lo que ignore la configuración global de una no cuenta.
+        # Ni sus exclusiones globales ni la plantilla de git init.
         global_ignore = self.base / "ignore-global"
         global_ignore.write_text(".env\n")
+        template = self.base / "plantilla"
+        (template / "info").mkdir(parents=True)
+        (template / "info" / "exclude").write_text(".env\n")
         Path(os.environ["GIT_CONFIG_GLOBAL"]).write_text(
             f"[core]\n\texcludesFile = {global_ignore.as_posix()}\n"
+            f"[init]\n\ttemplateDir = {template.as_posix()}\n"
         )
         xdg = self.base / "xdg" / "git"
         xdg.mkdir(parents=True)
@@ -311,7 +386,8 @@ class CredencialesTest(HigieneTestCase):
             f'params = {{"password": "{FAKE_PASSWORD}"}}\n'       # 6
             f'self.client_secret = "{FAKE_PASSWORD}"\n'           # 7
             f'config["Secret"] = "{FAKE_PASSWORD}"\n'             # 8
-            f"# clave vieja: {AWS_KEY}\n",                         # 9
+            f"# clave vieja: {AWS_KEY}\n"                          # 9
+            'API_TOKEN = " "\n',                                  # 10
         )
         self.write("projects/demo/python/scripts/uno.py",
                    f'\n\ntoken = "{FAKE_PASSWORD}"\n')
@@ -326,7 +402,7 @@ class CredencialesTest(HigieneTestCase):
              (f"{base}/scripts/roto.py", 25),
              (f"{base}/scripts/uno.py", 25)],
         )
-        self.assertIn("líneas 2, 3, 4, 5, 6, 7, 8, 9", h3[0]["message"])
+        self.assertIn("líneas 2, 3, 4, 5, 6, 7, 8, 9, 10", h3[0]["message"])
         self.assertIn("línea 2", h3[1]["message"])
         self.assertIn("línea 3", h3[2]["message"])
         self.assertNotIn("líneas", h3[2]["message"])
@@ -354,7 +430,6 @@ class CredencialesTest(HigieneTestCase):
             'password = os.environ["DATABASE_PASSWORD"]\n'
             'token = os.getenv("API_TOKEN", "")\n'
             'secret = ""\n'
-            'DB_PASSWORD = "   "\n'
             'conn = connect(password=os.environ["X"], user="admin")\n'
             'params = {"password": os.environ["X"], "host": "db.local"}\n'
             'secret_name = "prod/db"\n'
@@ -484,15 +559,14 @@ class ArregloTest(HigieneTestCase):
             "sin .gitignore": (None, b".env\n"),
         }
         for caso, (antes, despues) in casos.items():
-            for con_git in [True, False]:
-                with self.subTest(caso=caso, git=con_git):
+            for modo in MODOS:
+                with self.subTest(caso=caso, modo=modo):
                     self.setUp()
                     self.make_projects("demo", "otro")
                     gitignore = self.root / ".gitignore"
                     if antes is not None:
                         gitignore.write_bytes(antes)
-                    if con_git:
-                        self.git_repo(None)
+                    self.prepare(modo, None)
                     report, findings = self.check()
                     self.assertEqual(len(self.rules(findings, "H2")), 2)
                     self.assertEqual(self.score(report), 90)
@@ -505,24 +579,53 @@ class ArregloTest(HigieneTestCase):
                     self.assertEqual(self.score(report, "otro"), 100)
 
     def test_arreglo_gitignore_no_hace_nada_si_ya_ignora_env(self):
-        self.make_projects("demo")
-        gitignore = self.root / ".gitignore"
-        gitignore.write_bytes(b"*.pyc\n.env\n")
-        self.assertEqual(self.fix()(), [])
-        self.assertEqual(gitignore.read_bytes(), b"*.pyc\n.env\n")
+        for modo in MODOS:
+            with self.subTest(modo=modo):
+                self.setUp()
+                self.make_projects("demo")
+                gitignore = self.root / ".gitignore"
+                gitignore.write_bytes(b"*.pyc\n**/.env\n.env\n")
+                self.prepare(modo, None)
+                self.assertEqual(self.fix()(), [])
+                self.assertEqual(gitignore.read_bytes(), b"*.pyc\n**/.env\n.env\n")
+
+    def test_arreglo_decide_con_el_mismo_detector_que_h2(self):
+        # .env está en el .gitignore, pero una línea después des-ignora el de
+        # demo: H2 lo ve expuesto, y el arreglo tiene que corregirlo.
+        antes = b".env\n!projects/demo/python/.env\n"
+        for modo in MODOS_CON_GIT:
+            with self.subTest(modo=modo):
+                self.setUp()
+                self.make_projects("demo", "otro")
+                gitignore = self.root / ".gitignore"
+                gitignore.write_bytes(antes)
+                self.prepare(modo, None)
+                _, findings = self.check()
+                self.assertEqual(
+                    [(f["rule"], f["project"]) for f in findings],
+                    [("H2", "demo")],
+                )
+                self.assertEqual(self.fix()(), [gitignore])
+                self.assertEqual(gitignore.read_bytes(), antes + b".env\n")
+                report, findings = self.check()
+                self.assertEqual(findings, [])
+                self.assertEqual(self.score(report), 100)
 
     def test_arreglo_gitignore_no_escribe_a_traves_de_un_enlace(self):
         self.make_projects("demo")
         afuera = self.base / "afuera.txt"
-        afuera.write_text("node_modules/\n")
+        afuera.write_text(".env\n")
         try:
             (self.root / ".gitignore").symlink_to(afuera)
         except (OSError, NotImplementedError):
             self.skipTest("este sistema no permite crear enlaces simbólicos")
+        # git no lee un .gitignore que es un enlace: el .env queda expuesto.
+        _, findings = self.check()
+        self.assertEqual([f["rule"] for f in findings], ["H2"])
         with self.assertRaises(ValueError) as error:
             self.fix()()
         self.assertIn(".gitignore", str(error.exception))
-        self.assertEqual(afuera.read_text(), "node_modules/\n")
+        self.assertEqual(afuera.read_text(), ".env\n")
 
     def test_las_reglas_no_escriben_en_el_repo(self):
         self.make_projects("demo")
