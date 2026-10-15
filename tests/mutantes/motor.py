@@ -132,4 +132,9 @@ MUTANTES = [
     ("check --quick imprime el reporte completo",
      [("    elif args.quick:\n        say(quick_line(report))",
        "    elif False:\n        say(quick_line(report))")]),
+    ("check deja __pycache__ en el repo si el plugin está dentro",
+     [("    sys.dont_write_bytecode = True\n", "")]),
+    ("check protege la carga de checks/ pero no lo que importan las reglas",
+     [("    with without_bytecode():\n        check_repo(args)",
+       "    with without_bytecode():\n        discover_rules()\n    check_repo(args)")]),
 ]

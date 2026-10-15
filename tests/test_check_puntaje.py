@@ -210,6 +210,22 @@ class FormulaTest(CheckTestCase):
         # Solo cuenta a (60); b no tiene nota y no baja el promedio a 30.
         self.assertEqual(report["score"], 60)
 
+    def test_repo_promedia_las_notas_ya_redondeadas_de_los_proyectos(self):
+        self.make_projects("a", "b")
+        report = self.check_json([
+            self.rule("estructura", [
+                self.finding("estructura", 15, project="a"),
+                self.finding("estructura", 16, project="b"),
+            ]),
+            self.rule("dependencias"),
+        ])
+        # a: (85 + 100) / 2 = 92.5 → 93; b: (84 + 100) / 2 = 92.
+        self.assertEqual(self.project(report, "a")["score"], 93)
+        self.assertEqual(self.project(report, "b")["score"], 92)
+        # Con las notas que ve el usuario: (93 + 92) / 2 = 92.5 → 93.
+        # (Con las notas sin redondear sería (92.5 + 92) / 2 = 92.25 → 92.)
+        self.assertEqual(report["score"], 93)
+
     def test_redondeo_hacia_abajo_por_debajo_de_punto_cinco(self):
         self.make_projects("a", "b", "c")
         report = self.check_json([
@@ -487,6 +503,42 @@ class SalidaTest(CheckTestCase):
                 code, out, err = self.run_with_rules(rules, "check", *extra)
                 self.assertEqual(code, 0, out + err)
                 self.assertEqual(snapshot(), before)
+
+
+    def test_check_no_escribe_bytecode_aunque_el_plugin_este_en_la_raiz(self):
+        # Califica una raíz que contiene una copia del plugin (como cuando se
+        # califica el propio repo seedflow), en un proceso nuevo y sin
+        # PYTHONDONTWRITEBYTECODE: importar checks/ no puede dejar __pycache__.
+        self.make_projects("demo")
+        scripts = self.root / "plugin" / "scripts"
+        shutil.copytree(
+            SCRIPT.parent, scripts, ignore=shutil.ignore_patterns("__pycache__")
+        )
+        (scripts / "checks" / "zz_regla_falsa.py").write_text(
+            "from checks import CheckResult\n"
+            "CATEGORY = 'estructura'\n"
+            "QUICK = True\n"
+            "def run(ctx):\n"
+            "    import checks._ayuda_falsa  # importada recién al correr\n"
+            "    return CheckResult()\n"
+        )
+        (scripts / "checks" / "_ayuda_falsa.py").write_text("X = 1\n")
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("PYTHONDONTWRITEBYTECODE", "PYTHONPYCACHEPREFIX")}
+        before = sorted(p.relative_to(self.root).as_posix()
+                        for p in self.root.rglob("*"))
+        for extra in [(), ("--quick",), ("--json",)]:
+            with self.subTest(args=extra):
+                result = subprocess.run(
+                    [sys.executable, str(scripts / "seedflow.py"),
+                     "--root", str(self.root), "check", *extra],
+                    env=env, capture_output=True, text=True, check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("100", result.stdout)  # la regla falsa corrió
+                after = sorted(p.relative_to(self.root).as_posix()
+                               for p in self.root.rglob("*"))
+                self.assertEqual(after, before)
 
 
 class ContextoTest(CheckTestCase):

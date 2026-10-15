@@ -51,6 +51,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from collections.abc import Iterator
 from pathlib import Path
 from types import ModuleType
 from typing import TYPE_CHECKING
@@ -752,6 +753,21 @@ def cmd_delete_microservice(args: argparse.Namespace) -> None:
 # --------------------------------------------------------------------------
 
 
+@contextlib.contextmanager
+def without_bytecode() -> Iterator[None]:
+    """Importa sin escribir __pycache__: calificar nunca escribe en el repo.
+
+    Si el plugin está dentro de la raíz que se califica (por ejemplo, el
+    propio repo seedflow), importar checks/ dejaría .pyc en el repo.
+    """
+    previous = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        yield
+    finally:
+        sys.dont_write_bytecode = previous
+
+
 def load_checks() -> ModuleType:
     """El paquete checks/ que está junto a este script."""
     if str(SCRIPTS) not in sys.path:
@@ -841,7 +857,7 @@ def build_context(root: Path, quick: bool) -> checks.Context:
 
 
 def grade(score: int | None) -> str:
-    """'78/100 🟡', o 'sin nota' si no se pudo evaluar ninguna categoría."""
+    """'78/100 🟢', o 'sin nota' si no se pudo evaluar ninguna categoría."""
     if score is None:
         return "sin nota"
     return f"{score}/100 {load_checks().semaphore(score)}"
@@ -900,6 +916,13 @@ def print_finding(finding: checks.Finding) -> None:
 
 def cmd_check(args: argparse.Namespace) -> None:
     """Califica el repo. Solo lee: nunca escribe en el repo."""
+    # Cubre checks/, cada módulo de reglas y lo que importen al correr.
+    with without_bytecode():
+        check_repo(args)
+
+
+def check_repo(args: argparse.Namespace) -> None:
+    """Calcula la nota y la muestra en el formato pedido."""
     root = Path(args.root).resolve()
     rules = load_checks()
     modules = discover_rules()
