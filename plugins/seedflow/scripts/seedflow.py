@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""seedflow: crea y elimina proyectos y microservicios con la estructura Melonn.
+"""seedflow: crea, elimina y califica proyectos y microservicios Melonn.
 
 Es el motor determinista del plugin. No hace preguntas: recibe todo por
 argumentos. Las preguntas las hacen las skills antes de llamarlo, y una persona
@@ -14,6 +14,14 @@ Uso (siempre desde la carpeta raíz del repo, por ejemplo data-hub):
     seedflow.py delete-project NOMBRE (--dry-run | --yes)
     seedflow.py delete-microservice NOMBRE --project P --service-type TIPO
                                     (--dry-run | --yes)
+    seedflow.py check [--quick] [--json]
+    seedflow.py fix --list
+    seedflow.py fix FIX_ID [FIX_ID ...]
+
+check califica de 0 a 100 qué tan organizado está el repo. Las reglas viven
+en el paquete checks/ (un módulo por categoría, que check descubre solo);
+este script arma el contexto, las corre y muestra la nota. --quick deja fuera
+las reglas lentas (calidad de código) e imprime una sola línea.
 
 Garantías:
 
@@ -21,6 +29,7 @@ Garantías:
 - Nunca sobrescribe: si lo que va a crear ya existe, se detiene.
 - Si una creación falla a mitad de camino, deja la raíz como estaba; si no
   puede, lo dice y lista lo que quedó.
+- check solo lee: nunca escribe en el repo.
 
 No cubre dos comandos de seedflow corriendo a la vez sobre el mismo proyecto,
 ni otro proceso que cambie carpetas por enlaces mientras el comando corre
@@ -33,18 +42,27 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import importlib
 import json
 import os
+import pkgutil
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from types import ModuleType
+from typing import TYPE_CHECKING
 from typing import Any
 
 
-TEMPLATES = Path(__file__).resolve().parent.parent / "templates"
+if TYPE_CHECKING:
+    import checks
+
+
+SCRIPTS = Path(__file__).resolve().parent
+TEMPLATES = SCRIPTS.parent / "templates"
 SERVICE_TYPES = ("internal-services", "consumable-services")
 NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
 WINDOWS_RESERVED = {
@@ -64,6 +82,7 @@ IGNORED_IN_TEMPLATES = {
     ".ruff_cache",
     ".pytest_cache",
 }
+REVIEW_SKILL = "/seedflow:revisar"
 GENERIC_LAUNCH_CONFIG = {
     "name": "Python: Current File",
     "type": "debugpy",
@@ -729,6 +748,187 @@ def cmd_delete_microservice(args: argparse.Namespace) -> None:
 
 
 # --------------------------------------------------------------------------
+# Calificación (check)
+# --------------------------------------------------------------------------
+
+
+def load_checks() -> ModuleType:
+    """El paquete checks/ que está junto a este script."""
+    if str(SCRIPTS) not in sys.path:
+        sys.path.insert(0, str(SCRIPTS))
+    return importlib.import_module("checks")
+
+
+def discover_rules(package: ModuleType | None = None) -> list[ModuleType]:
+    """Los módulos de reglas del paquete checks/, en orden alfabético.
+
+    Cada módulo expone CATEGORY, QUICK y run(ctx). Los que empiezan por '_'
+    son ayudas internas y no se corren.
+    """
+    if package is None:
+        package = load_checks()
+    modules = []
+    found = pkgutil.iter_modules(package.__path__)
+    for info in sorted(found, key=lambda info: info.name):
+        if info.name.startswith("_"):
+            continue
+        module = importlib.import_module(f"{package.__name__}.{info.name}")
+        validate_rule_module(module, package.CATEGORIES)
+        modules.append(module)
+    return modules
+
+
+def validate_rule_module(
+    module: ModuleType, categories: tuple[str, ...]
+) -> None:
+    """Un módulo de reglas que no cumple el contrato es un error, no un 100."""
+    problems = []
+    if getattr(module, "CATEGORY", None) not in categories:
+        problems.append(f"CATEGORY debe ser una de {', '.join(categories)}")
+    if not isinstance(getattr(module, "QUICK", None), bool):
+        problems.append("QUICK debe ser True o False")
+    if not callable(getattr(module, "run", None)):
+        problems.append("falta la función run(ctx)")
+    if problems:
+        raise SeedError(
+            f"El módulo de reglas {module.__name__} no cumple el contrato: "
+            + "; ".join(problems)
+            + "."
+        )
+
+
+def git_tracked(root: Path) -> set[str] | None:
+    """Archivos que git sigue bajo root (relativos a root), o None sin git."""
+    git = find_tool("git")
+    if not git:
+        return None
+    try:
+        result = subprocess.run(
+            [git, "ls-files", "-z"],
+            cwd=root,
+            capture_output=True,
+            check=True,
+            timeout=30,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    return {os.fsdecode(p) for p in result.stdout.split(b"\0") if p}
+
+
+def plain_folders(folder: Path) -> list[Path]:
+    """Subcarpetas ordenadas, sin enlaces: calificar no los atraviesa."""
+    if not folder.is_dir() or is_link(folder):
+        return []
+    return sorted(
+        item for item in folder.iterdir() if item.is_dir() and not is_link(item)
+    )
+
+
+def build_context(root: Path, quick: bool) -> checks.Context:
+    """Proyectos, microservicios y archivos en git, para las reglas."""
+    rules = load_checks()
+    projects = []
+    for folder in plain_folders(projects_folder(root)):
+        python = folder / "python"
+        microservices = [
+            rules.Microservice(item.name, service_type, item)
+            for service_type in SERVICE_TYPES
+            if not is_link(python)
+            for item in plain_folders(python / service_type)
+        ]
+        projects.append(rules.Project(folder.name, folder, microservices))
+    return rules.Context(root, projects, git_tracked(root), quick)
+
+
+def grade(score: int | None) -> str:
+    """'78/100 🟡', o 'sin nota' si no se pudo evaluar ninguna categoría."""
+    if score is None:
+        return "sin nota"
+    return f"{score}/100 {load_checks().semaphore(score)}"
+
+
+def things_to_improve(report: checks.Report) -> str:
+    """'1 cosa por mejorar' o 'N cosas por mejorar'."""
+    count = len(report.findings)
+    things = "1 cosa" if count == 1 else f"{count} cosas"
+    return f"{things} por mejorar"
+
+
+def quick_line(report: checks.Report) -> str:
+    """La línea de resumen que muestran las skills al terminar."""
+    return (
+        f"{report.root.name}: {grade(report.score)} · "
+        f"{things_to_improve(report)} (sin calidad de código) "
+        f"· detalle: {REVIEW_SKILL}"
+    )
+
+
+def print_report(report: checks.Report) -> None:
+    """El reporte completo, legible en la terminal."""
+    rules = load_checks()
+    say(
+        f"📊 {report.root.name}: {grade(report.score)} · "
+        f"{things_to_improve(report)}"
+    )
+    for project in report.projects:
+        say(f"\n📁 {project.name}: {grade(project.score)}")
+        for category, score in project.categories.items():
+            label = rules.CATEGORY_LABELS[category]
+            value = (
+                f"{score}/100"
+                if score is not None
+                else f"no evaluada ({project.not_evaluated[category]})"
+            )
+            say(f"   - {label}: {value}")
+        for finding in report.findings:
+            if finding.project == project.name:
+                print_finding(finding)
+
+
+def print_finding(finding: checks.Finding) -> None:
+    """Un hallazgo con su porqué, cómo arreglarlo y si seedflow puede."""
+    fix = (
+        f"seedflow puede hacerlo (fix {finding.fix_id})"
+        if finding.fix_id
+        else "a mano"
+    )
+    say(f"   ❗ [{finding.rule}] -{finding.points} · {finding.path}")
+    say(f"      {finding.message}")
+    say(f"      Por qué: {finding.why}")
+    say(f"      Cómo: {finding.how} ({fix})")
+
+
+def cmd_check(args: argparse.Namespace) -> None:
+    """Califica el repo. Solo lee: nunca escribe en el repo."""
+    root = Path(args.root).resolve()
+    rules = load_checks()
+    modules = discover_rules()
+    ctx = build_context(root, args.quick)
+    if not ctx.projects:
+        if args.json:
+            empty = rules.Report(root, None, None, [], [])
+            print(json.dumps(empty.as_dict(), indent=2, ensure_ascii=False))
+            return
+        say(
+            f"{root.name}: no encontré proyectos en {root / 'projects'}, "
+            "así que no hay nota."
+        )
+        return
+    report = rules.evaluate(ctx, modules)
+    if args.json:
+        print(json.dumps(report.as_dict(), indent=2, ensure_ascii=False))
+    elif args.quick:
+        say(quick_line(report))
+    else:
+        print_report(report)
+
+
+def cmd_fix(args: argparse.Namespace) -> None:
+    """Aplica arreglos mecánicos (lo completa la tarea T-006)."""
+    raise SeedError("'fix' todavía no está disponible.")
+
+
+# --------------------------------------------------------------------------
 # Entrada
 # --------------------------------------------------------------------------
 
@@ -737,7 +937,7 @@ def build_parser() -> argparse.ArgumentParser:
     """Define los comandos y sus argumentos."""
     parser = argparse.ArgumentParser(
         prog="seedflow",
-        description="Crea y elimina proyectos y microservicios Melonn.",
+        description="Crea, elimina y califica proyectos Melonn.",
     )
     parser.add_argument(
         "--root",
@@ -788,6 +988,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_deletion_flags(delete_microservice)
     delete_microservice.set_defaults(func=cmd_delete_microservice)
+
+    check = commands.add_parser(
+        "check", help="Califica qué tan organizado está el repo."
+    )
+    check.add_argument(
+        "--quick",
+        action="store_true",
+        help="Solo las reglas rápidas, en una línea (sin calidad de código).",
+    )
+    check.add_argument("--json", action="store_true")
+    check.set_defaults(func=cmd_check)
+
+    fix = commands.add_parser("fix", help="Aplica arreglos mecánicos.")
+    fix.add_argument(
+        "--list", action="store_true", help="Lista los arreglos posibles."
+    )
+    fix.add_argument("fix_ids", nargs="*", metavar="FIX_ID")
+    fix.set_defaults(func=cmd_fix)
     return parser
 
 
