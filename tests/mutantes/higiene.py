@@ -5,6 +5,7 @@ la suite tiene que ponerse en rojo.
 """
 
 TARGET = "plugins/seedflow/scripts/checks/higiene.py"
+TESTS = ['test_check_higiene']
 
 # (qué se rompe, [(texto original, texto roto), ...])
 MUTANTES = [

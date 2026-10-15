@@ -18,12 +18,20 @@ Cada archivo define:
 Cada texto original se reemplaza una sola vez (la primera aparición) en
 TARGET; si no aparece, la falla cuenta como sobreviviente.
 
+Opcionalmente, un archivo define qué módulos de test cubren sus fallas:
+
+    TESTS = ["test_check_estructura"]
+
+Con TESTS, cada falla de ese archivo corre solo esos módulos (mucho más
+rápido); sin TESTS, corre la suite completa. Si una falla sobrevive con los
+módulos elegidos, el resultado lo muestra: lo peor que puede pasar es una falsa
+alarma, nunca una falla tapada.
+
 Desde la raíz del repo:
 
     python3 tests/mutantes.py
 
-Las fallas corren en paralelo, cada una en su propia copia de scripts/ y con
-la suite completa. SEEDFLOW_MUTANTES_JOBS fija cuántas a la vez (por defecto,
+Las fallas corren en paralelo, cada una en su propia copia de scripts/. SEEDFLOW_MUTANTES_JOBS fija cuántas a la vez (por defecto,
 la mitad de los núcleos).
 """
 
@@ -45,8 +53,8 @@ SCRIPTS = PLUGIN / "scripts"
 LISTAS = Path(__file__).resolve().parent / "mutantes"
 
 
-def cargar_listas() -> list[tuple[str, Path, list]]:
-    """(tema, TARGET relativo a scripts/, MUTANTES) de cada archivo de fallas."""
+def cargar_listas() -> list[tuple[str, Path, list, list[str]]]:
+    """(tema, TARGET relativo a scripts/, MUTANTES, TESTS) de cada archivo."""
     listas = []
     for archivo in sorted(LISTAS.glob("*.py")):
         datos = runpy.run_path(str(archivo))
@@ -56,16 +64,29 @@ def cargar_listas() -> list[tuple[str, Path, list]]:
                 f"{archivo.name}: TARGET debe ser un archivo dentro de "
                 f"{SCRIPTS.relative_to(REPO)}/ (es {datos['TARGET']!r})."
             )
+        tests = list(datos.get("TESTS", []))
+        for modulo in tests:
+            if not (Path(__file__).resolve().parent / f"{modulo}.py").is_file():
+                raise SystemExit(f"{archivo.name}: no existe tests/{modulo}.py")
         listas.append(
-            (archivo.stem, target.relative_to(SCRIPTS), datos["MUTANTES"])
+            (
+                archivo.stem,
+                target.relative_to(SCRIPTS),
+                datos["MUTANTES"],
+                tests,
+            )
         )
     return listas
 
 
-def run_suite(script: Path) -> bool:
-    """True si la suite pasa contra ese script."""
+def run_suite(script: Path, tests: list[str] | None = None) -> bool:
+    """True si la suite (o solo esos módulos de tests/) pasa con ese script."""
+    if tests:
+        comando = [sys.executable, "-m", "unittest", *[f"tests.{t}" for t in tests]]
+    else:
+        comando = [sys.executable, "-m", "unittest", "discover", "-s", "tests"]
     result = subprocess.run(
-        [sys.executable, "-m", "unittest", "discover", "-s", "tests"],
+        comando,
         cwd=REPO,
         env={
             **os.environ,
@@ -88,7 +109,7 @@ def mutar(texto: str, reemplazos: list) -> str | None:
     return texto
 
 
-def probar(target: Path, mutado: str) -> bool:
+def probar(target: Path, mutado: str, tests: list[str]) -> bool:
     """True si la suite detecta la falla (en una copia propia de scripts/)."""
     with tempfile.TemporaryDirectory() as temp:
         copia = Path(temp) / "scripts"
@@ -97,7 +118,7 @@ def probar(target: Path, mutado: str) -> bool:
         )
         (Path(temp) / "templates").symlink_to(PLUGIN / "templates")
         (copia / target).write_text(mutado, encoding="utf-8")
-        return not run_suite(copia / "seedflow.py")
+        return not run_suite(copia / "seedflow.py", tests)
 
 
 def trabajos() -> int:
@@ -115,19 +136,26 @@ def main() -> int:
         print("La suite ya falla con el script original: arregla eso primero.")
         return 1
     casos = []
-    for tema, target, mutantes in listas:
+    for tema, target, mutantes, tests in listas:
         original = (SCRIPTS / target).read_text(encoding="utf-8")
         for descripcion, reemplazos in mutantes:
             casos.append(
-                (f"[{tema}] {descripcion}", target, mutar(original, reemplazos))
+                (
+                    f"[{tema}] {descripcion}",
+                    target,
+                    mutar(original, reemplazos),
+                    tests,
+                )
             )
     sobrevivientes = []
     with concurrent.futures.ThreadPoolExecutor(trabajos()) as pool:
         futuros = [
-            pool.submit(probar, target, mutado) if mutado is not None else None
-            for _, target, mutado in casos
+            pool.submit(probar, target, mutado, tests)
+            if mutado is not None
+            else None
+            for _, target, mutado, tests in casos
         ]
-        for (nombre, _, _), futuro in zip(casos, futuros):
+        for (nombre, _, _, _), futuro in zip(casos, futuros):
             if futuro is None:
                 print(f"⚠️  no encontré el texto para «{nombre}»", flush=True)
                 sobrevivientes.append(nombre)
