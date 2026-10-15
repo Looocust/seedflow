@@ -99,3 +99,13 @@ puede recuperarlo mientras no haga commit del borrado:
 - Microservicio: `git restore <ruta> projects/<proyecto>/python/.vscode/launch.json`
 
 Si había archivos sin commitear o ignorados, recuérdale que esos no vuelven.
+
+Termina con la nota del repo. Corre, desde la carpeta raíz del repo:
+
+```bash
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/seedflow.py" check --quick
+```
+
+y muestra su línea tal cual, al final (es rápida: no revisa calidad de
+código). Si borraste el último proyecto, dice que no encontró proyectos: eso
+también va tal cual. Si falla, no afecta lo borrado: omítela.

@@ -183,3 +183,12 @@ comillas dobles, docstrings numpy, type hints en todo, un import por línea.
 Resume en pocas líneas qué quedó, qué TODOs dejaste y qué variables de entorno
 tiene que completar. Para depurarlo: abrir `python/` en VS Code y elegir la
 configuración `<nombre>` en Run and Debug. No hagas commit.
+
+Termina con la nota del repo. Corre, desde la carpeta raíz del repo:
+
+```bash
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/seedflow.py" check --quick
+```
+
+y muestra su línea tal cual, al final (es rápida: no revisa calidad de
+código). Si falla, no afecta lo creado: omítela.
