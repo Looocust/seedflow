@@ -21,10 +21,15 @@ TARGET; si no aparece, la falla cuenta como sobreviviente.
 Desde la raíz del repo:
 
     python3 tests/mutantes.py
+
+Las fallas corren en paralelo, cada una en su propia copia de scripts/ y con
+la suite completa. SEEDFLOW_MUTANTES_JOBS fija cuántas a la vez (por defecto,
+la mitad de los núcleos).
 """
 
 from __future__ import annotations
 
+import concurrent.futures
 import os
 import runpy
 import shutil
@@ -83,44 +88,55 @@ def mutar(texto: str, reemplazos: list) -> str | None:
     return texto
 
 
-def main() -> int:
-    """Corre cada mutante y reporta los que sobreviven."""
-    listas = cargar_listas()
-    if not run_suite(SCRIPTS / "seedflow.py"):
-        print("La suite ya falla con el script original: arregla eso primero.")
-        return 1
-
-    total = 0
-    sobrevivientes = []
+def probar(target: Path, mutado: str) -> bool:
+    """True si la suite detecta la falla (en una copia propia de scripts/)."""
     with tempfile.TemporaryDirectory() as temp:
         copia = Path(temp) / "scripts"
         shutil.copytree(
             SCRIPTS, copia, ignore=shutil.ignore_patterns("__pycache__")
         )
         (Path(temp) / "templates").symlink_to(PLUGIN / "templates")
-        for tema, target, mutantes in listas:
-            archivo = copia / target
-            original = archivo.read_text(encoding="utf-8")
-            for descripcion, reemplazos in mutantes:
-                total += 1
-                nombre = f"[{tema}] {descripcion}"
-                mutado = mutar(original, reemplazos)
-                if mutado is None:
-                    print(f"⚠️  no encontré el texto para «{nombre}»")
-                    sobrevivientes.append(nombre)
-                    continue
-                archivo.write_text(mutado, encoding="utf-8")
-                try:
-                    detectado = not run_suite(copia / "seedflow.py")
-                finally:
-                    archivo.write_text(original, encoding="utf-8")
-                if detectado:
-                    print(f"✅ detectado: {nombre}")
-                else:
-                    print(f"❌ sobrevive: {nombre}")
-                    sobrevivientes.append(nombre)
+        (copia / target).write_text(mutado, encoding="utf-8")
+        return not run_suite(copia / "seedflow.py")
 
-    print(f"\n{total - len(sobrevivientes)}/{total} detectados")
+
+def trabajos() -> int:
+    """Cuántas fallas corren a la vez."""
+    pedido = os.environ.get("SEEDFLOW_MUTANTES_JOBS", "")
+    if pedido.isdigit() and int(pedido) > 0:
+        return int(pedido)
+    return max(1, (os.cpu_count() or 2) // 2)
+
+
+def main() -> int:
+    """Corre cada mutante y reporta los que sobreviven."""
+    listas = cargar_listas()
+    if not run_suite(SCRIPTS / "seedflow.py"):
+        print("La suite ya falla con el script original: arregla eso primero.")
+        return 1
+    casos = []
+    for tema, target, mutantes in listas:
+        original = (SCRIPTS / target).read_text(encoding="utf-8")
+        for descripcion, reemplazos in mutantes:
+            casos.append(
+                (f"[{tema}] {descripcion}", target, mutar(original, reemplazos))
+            )
+    sobrevivientes = []
+    with concurrent.futures.ThreadPoolExecutor(trabajos()) as pool:
+        futuros = [
+            pool.submit(probar, target, mutado) if mutado is not None else None
+            for _, target, mutado in casos
+        ]
+        for (nombre, _, _), futuro in zip(casos, futuros):
+            if futuro is None:
+                print(f"⚠️  no encontré el texto para «{nombre}»", flush=True)
+                sobrevivientes.append(nombre)
+            elif futuro.result():
+                print(f"✅ detectado: {nombre}", flush=True)
+            else:
+                print(f"❌ sobrevive: {nombre}", flush=True)
+                sobrevivientes.append(nombre)
+    print(f"\n{len(casos) - len(sobrevivientes)}/{len(casos)} detectados")
     return 1 if sobrevivientes else 0
 
 
