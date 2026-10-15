@@ -50,18 +50,41 @@ FAKE_TOOLS = r'''
 import json
 import os
 import re
+import runpy
 import sys
 from pathlib import Path
 
 env = Path(__file__).resolve().parent
-args = sys.argv[1:]
-if args[0] == "-c":  # un script de seedflow que corre con este python
-    sys.argv = ["-c", *args[2:]]
-    exec(compile(args[1], "<seedflow>", "exec"))
-    sys.exit(0)
+program = sys.argv[1]  # "python" o "ruff": el ejecutable del entorno
+args = sys.argv[2:]
+isolated = False
+if program == "python":
+    while args[0] in ("-I", "-E", "-s"):
+        isolated = isolated or args[0] == "-I"
+        args = args[1:]
+    # Como python: sin -I, la carpeta actual (con -m y -c) y PYTHONPATH van
+    # antes que lo instalado, y un ruff.py o tomllib.py de ahí se importa.
+    search = [] if isolated else [
+        os.getcwd(),
+        *filter(None, os.environ.get("PYTHONPATH", "").split(os.pathsep)),
+    ]
+    if args[0] == "-c":  # un script de seedflow que corre con este python
+        sys.path[:0] = search
+        sys.argv = ["-c", *args[2:]]
+        exec(compile(args[1], "<seedflow>", "exec"))
+        sys.exit(0)
+    for folder in search:
+        local = Path(folder) / f"{args[1]}.py"
+        if local.exists():
+            runpy.run_path(str(local), run_name="__main__")
+            sys.exit(0)
+else:
+    args = ["-m", program, *args]  # el binario nativo no importa nada
 tool = args[1]
 with (env / "calls.jsonl").open("a", encoding="utf-8") as log:
-    log.write(json.dumps({"argv": args, "cwd": os.getcwd()}) + "\n")
+    log.write(json.dumps({"argv": args, "cwd": os.getcwd(),
+                          "program": program, "isolated": isolated,
+                          "pythonpath": os.environ.get("PYTHONPATH")}) + "\n")
 fail = env / f"fail-{tool}"
 if fail.exists():
     print(fail.read_text(), file=sys.stderr)
@@ -152,10 +175,14 @@ class FakeInstaller:
         self.fail = fail  # None, "venv" o "pip"
         self.pips = []    # (carpeta del entorno, paquetes pedidos)
         self.venvs = []
+        self.cwds = []
 
-    def __call__(self, command):
+    def __call__(self, command, cwd):
         command = [str(part) for part in command]
-        if command[1:3] == ["-m", "venv"]:
+        self.cwds.append(Path(cwd))
+        # Siempre con -I: ni la carpeta actual ni PYTHONPATH pueden cambiar
+        # qué venv o qué pip corre.
+        if command[1:4] == ["-I", "-m", "venv"]:
             env = Path(command[-1])
             self.venvs.append(env)
             if self.fail == "venv":
@@ -164,18 +191,21 @@ class FakeInstaller:
                 )
             (env / "bin").mkdir(parents=True)
             (env / "fake_tools.py").write_text(FAKE_TOOLS, encoding="utf-8")
-            python = env / "bin" / "python"
-            python.write_text(
-                "#!/bin/sh\n"
-                f"exec {shlex.quote(sys.executable)} "
-                f'"$(dirname "$0")/../fake_tools.py" "$@"\n'
-            )
-            python.chmod(0o755)
+            for program in ["python", "ruff"]:
+                wrapper = env / "bin" / program
+                wrapper.write_text(
+                    "#!/bin/sh\n"
+                    # -I: el falso mismo no lee PYTHONPATH; imita a python
+                    # (o no) según los argumentos que le pasa seedflow.
+                    f"exec {shlex.quote(sys.executable)} -I "
+                    f'"$(dirname "$0")/../fake_tools.py" {program} "$@"\n'
+                )
+                wrapper.chmod(0o755)
             return
-        if command[1:4] == ["-m", "pip", "install"]:
+        if command[1:5] == ["-I", "-m", "pip", "install"]:
             env = Path(command[0]).parent.parent
             self.pips.append(
-                (env, [c for c in command[4:] if not c.startswith("-")])
+                (env, [c for c in command[5:] if not c.startswith("-")])
             )
             if self.fail == "pip":
                 raise subprocess.CalledProcessError(
@@ -303,6 +333,24 @@ class CalidadTestCase(unittest.TestCase):
             )
         return result
 
+    def malicious(self, *folders):
+        """ruff.py, mypy.py, tomllib.py y tomli.py que dejan una marca."""
+        for folder in folders:
+            for name in ["ruff", "mypy", "tomllib", "tomli"]:
+                (folder / f"{name}.py").write_text(
+                    '"""Módulo del proyecto que seedflow no debe importar."""\n'
+                    "\n"
+                    "import pathlib\n"
+                    "\n"
+                    "\n"
+                    'pathlib.Path(__file__).with_name("HACKED").write_text("x")\n'
+                    'print("[]")\n'
+                )
+
+    def hacked(self):
+        return sorted(p.relative_to(self.root).as_posix()
+                      for p in self.root.rglob("HACKED"))
+
     def use_real_tools(self):
         """ruff 0.9.6 y mypy 1.15.0 de verdad, ya instalados (sin internet).
 
@@ -335,6 +383,16 @@ class InstalacionTest(CalidadTestCase):
         self.assertEqual(sorted(p.name for p in self.tools.iterdir()),
                          ["ruff-0.9.6_mypy-1.15.0"])
         self.assertTrue(self.tool_calls())  # y las herramientas sí corrieron
+
+    def test_un_entorno_roto_se_reinstala(self):
+        # Por ejemplo, de una versión anterior o de una instalación cortada:
+        # sin el binario de ruff no sirve.
+        self.create("demo")
+        self.report()
+        (self.default_env() / "bin" / "ruff").unlink()
+        self.assertEqual(self.calidad_of(self.report()), (100, None))
+        self.assertEqual(len(self.installer.pips), 2)
+        self.assertTrue((self.default_env() / "bin" / "ruff").exists())
 
     def test_sin_seedflow_tools_dir_usa_la_cache_de_seedflow(self):
         self.create("demo")
@@ -548,6 +606,13 @@ class ReglasTest(CalidadTestCase):
         )
         self.assertNotIn(str(self.microservice()), argv)
         self.assertNotIn(str(self.root), mypy[0]["cwd"])
+        # Aislado (-I) y con el python del entorno para buscar paquetes: ni
+        # el python_executable del pyproject ni un python3.12 del PATH.
+        self.assertTrue(mypy[0]["isolated"])
+        self.assertEqual(
+            argv[argv.index("--python-executable") + 1],
+            str(self.default_env() / "bin" / "python"),
+        )
 
     def test_microservicio_sin_codigo_no_corre_ruff_ni_mypy(self):
         # Sin archivos, ruff revisaría la carpeta donde corre y mypy se queja.
@@ -803,6 +868,97 @@ class ReglasTest(CalidadTestCase):
         [mypy] = [c for c in self.tool_calls() if c["argv"][1] == "mypy"]
         self.assertFalse([a for a in mypy["argv"] if "generated" in a])
 
+    def test_las_herramientas_no_importan_codigo_del_proyecto(self):
+        self.create("demo")
+        python = self.root / "projects/demo/python"
+        self.malicious(python, self.microservice())
+        self.add_code(self.errors("ERR_RUFF_FIX", 1) + self.errors("ERR_MYPY", 1))
+        with mock.patch.dict(os.environ, {
+            "PYTHONPATH": os.pathsep.join([str(python), str(self.microservice())])
+        }):
+            report = self.report()
+            touched = self.calidad.FIXES["C1"](
+                self.root, "C1:demo/internal-services/orders"
+            )
+        self.assertEqual(self.hacked(), [])
+        self.assertEqual(
+            sorted((f["rule"], f["points"]) for f in self.findings(report)
+                   if "extra.py" in f["message"]),
+            [("C1", 2), ("C3", 2)],
+        )
+        self.assertEqual(touched, [self.microservice() / "src/service/extra.py"])
+        calls = self.tool_calls()
+        self.assertTrue(calls)
+        for call in calls:
+            # Sin PYTHONPATH para nada de lo que lancen las herramientas.
+            self.assertIsNone(call["pythonpath"])
+            if call["argv"][1] == "ruff":
+                self.assertEqual(call["program"], "ruff")  # el binario
+            else:
+                self.assertTrue(call["isolated"])
+
+    def test_la_instalacion_corre_aislada_y_fuera_del_repo(self):
+        self.create("demo")
+        self.report()
+        self.assertEqual(len(self.installer.cwds), 2)  # venv y pip
+        for cwd in self.installer.cwds:
+            self.assertNotIn(str(self.root), str(cwd))
+            self.assertIn(self.tools, [cwd, *cwd.parents])
+
+    def test_tools_dir_relativo_funciona(self):
+        self.create("demo")
+        relative = os.path.relpath(self.tools)
+        with mock.patch.dict(os.environ, {"SEEDFLOW_TOOLS_DIR": relative}):
+            self.assertEqual(self.calidad_of(self.report()), (100, None))
+        self.assertTrue(self.tool_calls())
+
+    def test_opciones_de_reporte_de_mypy_1_15(self):
+        self.assertEqual(
+            sorted(self.calidad.MYPY_REPORT_OPTIONS),
+            sorted([
+                "any_exprs_report", "cobertura_xml_report", "html_report",
+                "linecount_report", "linecoverage_report",
+                "lineprecision_report", "memory_xml_report", "txt_report",
+                "xml_report", "xslt_html_report", "xslt_txt_report",
+                "junit_xml",
+            ]),
+        )
+
+    def test_pyproject_con_reportes_de_mypy_no_se_evalua(self):
+        self.create("demo")
+        self.add_code(self.errors("ERR_RUFF", 1))
+        for option in sorted(self.calidad.MYPY_REPORT_OPTIONS) + [
+            "linecount-report"
+        ]:
+            with self.subTest(opcion=option):
+                path = self.root / "projects/demo/python/pyproject.toml"
+                original = path.read_text()
+                self.configure("tool.mypy", f'{option} = "reportes"')
+                try:
+                    before = len(self.tool_calls())
+                    score, reason = self.calidad_of(self.report())
+                finally:
+                    path.write_text(original)
+                self.assertIsNone(score)
+                self.assertIn("reportes de mypy", reason)
+                self.assertIn(option.replace("-", "_"), reason)
+                self.assertIn("seedflow no escribe archivos al calificar",
+                              reason)
+                mypy = [c for c in self.tool_calls()[before:]
+                        if c["argv"][1] == "mypy"]
+                self.assertEqual(mypy, [])
+
+    def test_pyproject_con_plugins_de_mypy_no_se_evalua(self):
+        self.create("demo")
+        self.configure("tool.mypy", 'plugins = ["mi_plugin"]')
+        score, reason = self.calidad_of(self.report())
+        self.assertIsNone(score)
+        self.assertIn("plugins de mypy", reason)
+        self.assertIn("mi_plugin", reason)
+        self.assertEqual(
+            [c for c in self.tool_calls() if c["argv"][1] == "mypy"], []
+        )
+
     def test_exclude_de_mypy_invalido_deja_el_proyecto_sin_evaluar(self):
         self.create("demo")
         self.configure("tool.mypy", 'exclude = ["(sin cerrar"]')
@@ -830,6 +986,43 @@ class HerramientasRealesTest(CalidadTestCase):
     def setUp(self):
         super().setUp()
         self.use_real_tools()
+
+    def test_codigo_del_proyecto_no_se_ejecuta_al_calificar_ni_arreglar(self):
+        self.create("demo")
+        python = self.root / "projects/demo/python"
+        self.malicious(python, self.microservice())
+        evil = python / "evil-python"
+        evil.write_text("#!/bin/sh\ntouch \"$(dirname \"$0\")/HACKED\"\n")
+        evil.chmod(0o755)
+        self.configure("tool.mypy", f'python_executable = "{evil}"')
+        self.add_code('"""Extra."""\n\nimport os\n\ny: int = "uno"\n')
+        before = self.snapshot()
+        with mock.patch.dict(os.environ, {
+            "PYTHONPATH": os.pathsep.join([str(python), str(self.microservice())])
+        }):
+            report = self.report()
+            self.assertEqual(self.snapshot(), before)
+            touched = self.calidad.FIXES["C1"](
+                self.root, "C1:demo/internal-services/orders"
+            )
+        self.assertEqual(self.hacked(), [])
+        # Corrieron ruff y mypy de verdad (los falsos imprimen "[]"); el
+        # tomllib.py del microservicio también es código que ruff revisa.
+        messages = [f["message"] for f in self.findings(report)]
+        self.assertIn("src/service/extra.py:3 F401", "\n".join(messages))
+        self.assertIn("mypy encontró 1 error: src/service/extra.py:5", messages)
+        self.assertEqual(touched, [self.microservice() / "src/service/extra.py"])
+
+    def test_reportes_de_mypy_no_se_escriben_en_el_repo(self):
+        self.create("demo")
+        self.configure("tool.mypy", 'linecount_report = "reportes-mypy"')
+        self.add_code('"""Extra."""\n\ny: int = "uno"\n')
+        before = self.snapshot()
+        score, reason = self.calidad_of(self.report())
+        self.assertEqual(self.snapshot(), before)
+        self.assertIsNone(score)
+        self.assertIn("linecount_report", reason)
+        self.assertEqual(list(self.root.rglob("reportes-mypy")), [])
 
     def test_fix_en_el_pyproject_no_cambia_el_codigo_al_calificar(self):
         for setting in ["fix = true", "fix-only = true"]:

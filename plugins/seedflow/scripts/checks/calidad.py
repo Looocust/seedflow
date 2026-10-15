@@ -51,7 +51,7 @@ PIN = re.compile(
 RUFF_SUFFIXES = (".py", ".pyi", ".ipynb")  # lo que ruff revisa por defecto
 TODO = re.compile(r"\bTODO\b")
 MYPY_LOCATION = re.compile(r"^(.+?):(\d+)(?::\d+)?: error:")
-READ_MYPY_EXCLUDE = """
+READ_MYPY_SETTINGS = """
 import json, sys
 try:
     import tomllib
@@ -59,10 +59,33 @@ except ImportError:
     import tomli as tomllib
 with open(sys.argv[1], "rb") as file:
     mypy = tomllib.load(file).get("tool", {}).get("mypy", {})
-exclude = mypy.get("exclude", [])
-exclude = [exclude] if isinstance(exclude, str) else exclude
-print(json.dumps([p.strip() for p in exclude if p.strip()]))
+def as_list(value):
+    value = [value] if isinstance(value, str) else value
+    return [str(item).strip() for item in value if str(item).strip()]
+print(json.dumps({
+    "keys": sorted(mypy),
+    "exclude": as_list(mypy.get("exclude", [])),
+    "plugins": as_list(mypy.get("plugins", [])),
+}))
 """
+# Opciones de [tool.mypy] (mypy 1.15) que escriben archivos de reporte: las
+# *_report de mypy.defaults.REPORTER_NAMES, más junit_xml.
+MYPY_REPORT_OPTIONS = frozenset(
+    {
+        "any_exprs_report",
+        "cobertura_xml_report",
+        "html_report",
+        "linecount_report",
+        "linecoverage_report",
+        "lineprecision_report",
+        "memory_xml_report",
+        "txt_report",
+        "xml_report",
+        "xslt_html_report",
+        "xslt_txt_report",
+        "junit_xml",
+    }
+)
 INSTALL_TIMEOUT = 900
 TOOL_TIMEOUT = 600
 
@@ -95,7 +118,8 @@ def tools_home() -> Path:
     """
     custom = os.environ.get("SEEDFLOW_TOOLS_DIR")
     if custom:
-        return Path(custom)
+        # Absoluta: las herramientas corren con otra carpeta actual.
+        return Path(custom).absolute()
     if WINDOWS:
         local = os.environ.get("LOCALAPPDATA")
         base = Path(local) if local else Path.home() / "AppData" / "Local"
@@ -123,10 +147,24 @@ def python_of(env: Path) -> Path:
     return env / "bin" / "python"
 
 
-def install_step(command: list[str]) -> None:
+def ruff_of(env: Path) -> Path:
+    """El binario nativo de ruff del entorno: no importa nada de cwd."""
+    if WINDOWS:
+        return env / "Scripts" / "ruff.exe"
+    return env / "bin" / "ruff"
+
+
+def tools_ready(env: Path) -> bool:
+    """Si el entorno ya tiene python y el binario de ruff."""
+    return python_of(env).exists() and ruff_of(env).exists()
+
+
+def install_step(command: list[str], cwd: Path) -> None:
     """Corre un paso de la instalación; si falla, lanza el error."""
     subprocess.run(
         command,
+        cwd=cwd,
+        env=tool_env(),
         capture_output=True,
         text=True,
         check=True,
@@ -141,7 +179,7 @@ def ensure_tools(versions: Versions) -> Path:
     medias nunca queda con el nombre definitivo. Lanza ToolError si no puede.
     """
     env = tools_home() / f"ruff-{versions.ruff}_mypy-{versions.mypy}"
-    if python_of(env).exists():
+    if tools_ready(env):
         return env
     try:
         env.parent.mkdir(parents=True, exist_ok=True)
@@ -149,10 +187,15 @@ def ensure_tools(versions: Versions) -> Path:
     except OSError as error:
         raise ToolError(install_failure(versions, env, error)) from error
     try:
-        install_step([sys.executable, "-m", "venv", str(staging)])
+        # -I y cwd en la carpeta de herramientas: ni la carpeta actual (el
+        # repo) ni PYTHONPATH pueden cambiar qué venv o qué pip corre.
+        install_step(
+            [sys.executable, "-I", "-m", "venv", str(staging)], env.parent
+        )
         install_step(
             [
                 str(python_of(staging)),
+                "-I",
                 "-m",
                 "pip",
                 "install",
@@ -161,11 +204,14 @@ def ensure_tools(versions: Versions) -> Path:
                 "--quiet",
                 f"ruff=={versions.ruff}",
                 f"mypy=={versions.mypy}",
-            ]
+            ],
+            env.parent,
         )
+        if env.exists():  # un entorno roto de seedflow: sin python o sin ruff
+            shutil.rmtree(env)
         staging.rename(env)
     except (OSError, subprocess.SubprocessError) as error:
-        if not python_of(env).exists():  # otro proceso pudo ganar la carrera
+        if not tools_ready(env):  # otro proceso pudo ganar la carrera
             raise ToolError(install_failure(versions, env, error)) from error
     finally:
         shutil.rmtree(staging, ignore_errors=True)
@@ -194,37 +240,51 @@ def error_detail(error: Exception) -> str:
 
 
 def tool_env() -> dict[str, str]:
-    """Variables de entorno sin las que cambian lo que revisan ruff o mypy."""
+    """Variables de entorno sin las que cambian lo que revisan ruff o mypy.
+
+    Tampoco pasan las PYTHON* (PYTHONPATH, PYTHONHOME...): ningún python que
+    lancen las herramientas puede importar código del proyecto.
+    """
     return {
         key: value
         for key, value in os.environ.items()
-        if not key.upper().startswith(("RUFF_", "MYPY"))
+        if not key.upper().startswith(("RUFF_", "MYPY", "PYTHON"))
     }
 
 
-def run_tool(
-    env: Path, args: list[str], ok: tuple[int, ...], cwd: Path | None = None
+def run_ruff(
+    env: Path, args: list[str], ok: tuple[int, ...], cwd: Path
 ) -> subprocess.CompletedProcess[str]:
-    """Corre `python -m <herramienta>` del entorno (en cwd, o en el entorno).
+    """Corre el binario de ruff del entorno en cwd.
 
-    Lanza ToolError si la herramienta no responde o sale con un código que
-    no está en ok.
+    Es nativo: no importa módulos de Python, así que puede correr junto al
+    pyproject sin que un ruff.py del proyecto lo reemplace.
     """
-    return run_python(env, ["-m", *args], ok, args[0], cwd)
+    return run_command([str(ruff_of(env)), *args], ok, "ruff", cwd)
 
 
 def run_python(
-    env: Path,
-    args: list[str],
-    ok: tuple[int, ...],
-    what: str,
-    cwd: Path | None = None,
+    env: Path, args: list[str], ok: tuple[int, ...], what: str
 ) -> subprocess.CompletedProcess[str]:
-    """Corre el python del entorno de herramientas con esos argumentos."""
+    """Corre el python del entorno, aislado (-I) y en el entorno.
+
+    Sin -I, la carpeta actual y PYTHONPATH van antes que lo instalado: un
+    mypy.py o tomllib.py del proyecto se importaría en su lugar.
+    """
+    return run_command([str(python_of(env)), "-I", *args], ok, what, env)
+
+
+def run_command(
+    command: list[str], ok: tuple[int, ...], what: str, cwd: Path
+) -> subprocess.CompletedProcess[str]:
+    """Corre una herramienta; lanza ToolError si no responde o falla.
+
+    Fallar es salir con un código que no está en ok.
+    """
     try:
         result = subprocess.run(
-            [str(python_of(env)), *args],
-            cwd=cwd or env,
+            command,
+            cwd=cwd,
             env=tool_env(),
             capture_output=True,
             text=True,
@@ -238,7 +298,7 @@ def run_python(
     if result.returncode not in ok:
         detail = error_detail(
             subprocess.CalledProcessError(
-                result.returncode, args, result.stdout, result.stderr
+                result.returncode, command, result.stdout, result.stderr
             )
         )
         raise ToolError(f"{what} falló (código {result.returncode}): {detail}")
@@ -286,10 +346,9 @@ def ruff_check(env: Path, files: list[str], config: Path | None) -> list[dict]:
     """Los errores de `ruff check` en esos archivos."""
     if not files:
         return []
-    result = run_tool(
+    result = run_ruff(
         env,
         [
-            "ruff",
             "check",
             "--no-cache",
             # Calificar nunca escribe, aunque el pyproject pida fix o fix-only.
@@ -321,10 +380,9 @@ def ruff_unformatted(
     """Los archivos que `ruff format` cambiaría."""
     if not files:
         return []
-    result = run_tool(
+    result = run_ruff(
         env,
         [
-            "ruff",
             "format",
             "--check",
             "--no-cache",
@@ -348,24 +406,35 @@ def mypy_errors(env: Path, files: list[Path], config: Path | None) -> list[str]:
     Recibe los archivos de iter_files, no la carpeta: así mypy tampoco entra
     a entornos ni cachés.
     """
-    result = run_tool(
+    result = run_python(
         env,
         [
+            "-m",
             "mypy",
             f"--config-file={config}" if config else "--config-file=",
             "--cache-dir",
             str(env / "mypy-cache"),
+            # Busca paquetes con el python del entorno: ni el
+            # python_executable del pyproject (lo ejecutaría) ni un python
+            # del PATH (la nota dependería de lo que cada uno tenga).
+            "--python-executable",
+            str(python_of(env)),
             "--no-error-summary",
             "--show-absolute-path",
             *(str(path) for path in files),
         ],
         ok=(0, 1),
+        what="mypy",
     )
     return [line for line in result.stdout.splitlines() if ": error:" in line]
 
 
 def mypy_exclude(env: Path, config: Path | None) -> list[re.Pattern[str]]:
     """Los patrones `exclude` de [tool.mypy] del pyproject.
+
+    Antes de correr mypy revisa que el pyproject no pida algo que escriba
+    archivos (reportes) o ejecute código del proyecto (plugins): en ese caso
+    lanza ToolError y la calidad del proyecto queda "no evaluada".
 
     El TOML se lee con el python del entorno de herramientas (tomllib, o
     tomli, que mypy trae en Python < 3.11): seedflow solo usa la librería
@@ -375,14 +444,31 @@ def mypy_exclude(env: Path, config: Path | None) -> list[re.Pattern[str]]:
         return []
     result = run_python(
         env,
-        ["-c", READ_MYPY_EXCLUDE, str(config)],
+        ["-c", READ_MYPY_SETTINGS, str(config)],
         ok=(0,),
-        what="leer el exclude de mypy",
+        what="leer [tool.mypy] del pyproject",
     )
     try:
-        patterns = json.loads(result.stdout)
+        settings = json.loads(result.stdout)
+        keys = {key.lower().replace("-", "_") for key in settings["keys"]}
+        plugins = [str(plugin) for plugin in settings["plugins"]]
+        patterns = [str(pattern) for pattern in settings["exclude"]]
+    except (ValueError, TypeError, KeyError, AttributeError) as error:
+        raise ToolError(f"no se pudo leer [tool.mypy] de {config}") from error
+    reports = sorted(keys & MYPY_REPORT_OPTIONS)
+    if reports:
+        raise ToolError(
+            f"el pyproject pide reportes de mypy ({', '.join(reports)}); "
+            "seedflow no escribe archivos al calificar"
+        )
+    if plugins:
+        raise ToolError(
+            f"el pyproject pide plugins de mypy ({', '.join(plugins)}); "
+            "seedflow no ejecuta código del proyecto al calificar"
+        )
+    try:
         return [re.compile(pattern) for pattern in patterns]
-    except (ValueError, TypeError, re.error) as error:
+    except re.error as error:
         raise ToolError(
             f"exclude de mypy inválido en {config}: {error}"
         ) from error
@@ -673,9 +759,9 @@ def apply_ruff(
         config = pyproject(project)
         files = ruff_files(folder)
         if files:
-            run_tool(
+            run_ruff(
                 env,
-                ["ruff", *args, "--no-cache", *ruff_config(config), *files],
+                [*args, "--no-cache", *ruff_config(config), *files],
                 ok=(0, 1),
                 cwd=ruff_cwd(env, config),
             )
