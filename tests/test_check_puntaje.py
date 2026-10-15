@@ -60,9 +60,16 @@ class CheckTestCase(unittest.TestCase):
         self.base = Path(temp.name).resolve()
         self.root = self.base / "repo"
         self.root.mkdir()
-        # Que git no encuentre un repo por encima de la carpeta temporal.
+        # Que git no encuentre un repo por encima de la carpeta temporal, y
+        # que la regla de calidad (si corre) no instale nada: entorno de
+        # herramientas en el temporal y pip sin acceso a internet.
         patcher = mock.patch.dict(
-            os.environ, {"GIT_CEILING_DIRECTORIES": str(self.base)}
+            os.environ,
+            {
+                "GIT_CEILING_DIRECTORIES": str(self.base),
+                "SEEDFLOW_TOOLS_DIR": str(self.base / "tools"),
+                "PIP_NO_INDEX": "1",
+            },
         )
         patcher.start()
         self.addCleanup(patcher.stop)
