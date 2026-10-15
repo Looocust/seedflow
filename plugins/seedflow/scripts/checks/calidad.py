@@ -51,6 +51,18 @@ PIN = re.compile(
 RUFF_SUFFIXES = (".py", ".pyi", ".ipynb")  # lo que ruff revisa por defecto
 TODO = re.compile(r"\bTODO\b")
 MYPY_LOCATION = re.compile(r"^(.+?):(\d+)(?::\d+)?: error:")
+READ_MYPY_EXCLUDE = """
+import json, sys
+try:
+    import tomllib
+except ImportError:
+    import tomli as tomllib
+with open(sys.argv[1], "rb") as file:
+    mypy = tomllib.load(file).get("tool", {}).get("mypy", {})
+exclude = mypy.get("exclude", [])
+exclude = [exclude] if isinstance(exclude, str) else exclude
+print(json.dumps([p.strip() for p in exclude if p.strip()]))
+"""
 INSTALL_TIMEOUT = 900
 TOOL_TIMEOUT = 600
 
@@ -191,17 +203,28 @@ def tool_env() -> dict[str, str]:
 
 
 def run_tool(
-    env: Path, args: list[str], ok: tuple[int, ...]
+    env: Path, args: list[str], ok: tuple[int, ...], cwd: Path | None = None
 ) -> subprocess.CompletedProcess[str]:
-    """Corre `python -m <herramienta>` del entorno, fuera del repo.
+    """Corre `python -m <herramienta>` del entorno (en cwd, o en el entorno).
 
     Lanza ToolError si la herramienta no responde o sale con un código que
     no está en ok.
     """
+    return run_python(env, ["-m", *args], ok, args[0], cwd)
+
+
+def run_python(
+    env: Path,
+    args: list[str],
+    ok: tuple[int, ...],
+    what: str,
+    cwd: Path | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Corre el python del entorno de herramientas con esos argumentos."""
     try:
         result = subprocess.run(
-            [str(python_of(env)), "-m", *args],
-            cwd=env,
+            [str(python_of(env)), *args],
+            cwd=cwd or env,
             env=tool_env(),
             capture_output=True,
             text=True,
@@ -211,16 +234,14 @@ def run_tool(
             timeout=TOOL_TIMEOUT,
         )
     except (OSError, subprocess.SubprocessError) as error:
-        raise ToolError(f"{args[0]} no respondió: {error}") from error
+        raise ToolError(f"{what} no respondió: {error}") from error
     if result.returncode not in ok:
         detail = error_detail(
             subprocess.CalledProcessError(
                 result.returncode, args, result.stdout, result.stderr
             )
         )
-        raise ToolError(
-            f"{args[0]} falló (código {result.returncode}): {detail}"
-        )
+        raise ToolError(f"{what} falló (código {result.returncode}): {detail}")
     return result
 
 
@@ -242,6 +263,16 @@ def ruff_config(config: Path | None) -> list[str]:
     return [*args, "--force-exclude"]
 
 
+def ruff_cwd(env: Path, config: Path | None) -> Path:
+    """Dónde corre ruff: junto al pyproject, como en el proyecto.
+
+    Con --config, ruff resuelve las rutas relativas de la configuración
+    (exclude, per-file-ignores...) desde la carpeta en la que corre. Sin
+    pyproject, en el entorno de herramientas. Con --no-cache no deja nada.
+    """
+    return config.parent if config else env
+
+
 def ruff_files(folder: Path) -> list[str]:
     """Lo que revisa ruff, sin entornos ni cachés (como las demás reglas).
 
@@ -261,12 +292,17 @@ def ruff_check(env: Path, files: list[str], config: Path | None) -> list[dict]:
             "ruff",
             "check",
             "--no-cache",
+            # Calificar nunca escribe, aunque el pyproject pida fix o fix-only.
+            "--no-fix",
+            "--no-fix-only",
+            "--no-unsafe-fixes",
             "--output-format",
             "json",
             *ruff_config(config),
             *files,
         ],
         ok=(0, 1),
+        cwd=ruff_cwd(env, config),
     )
     try:
         errors = json.loads(result.stdout)
@@ -296,6 +332,7 @@ def ruff_unformatted(
             *files,
         ],
         ok=(0, 1),
+        cwd=ruff_cwd(env, config),
     )
     prefix = "Would reformat: "
     return [
@@ -325,6 +362,54 @@ def mypy_errors(env: Path, files: list[Path], config: Path | None) -> list[str]:
         ok=(0, 1),
     )
     return [line for line in result.stdout.splitlines() if ": error:" in line]
+
+
+def mypy_exclude(env: Path, config: Path | None) -> list[re.Pattern[str]]:
+    """Los patrones `exclude` de [tool.mypy] del pyproject.
+
+    El TOML se lee con el python del entorno de herramientas (tomllib, o
+    tomli, que mypy trae en Python < 3.11): seedflow solo usa la librería
+    estándar de 3.8, que no lee TOML.
+    """
+    if config is None:
+        return []
+    result = run_python(
+        env,
+        ["-c", READ_MYPY_EXCLUDE, str(config)],
+        ok=(0,),
+        what="leer el exclude de mypy",
+    )
+    try:
+        patterns = json.loads(result.stdout)
+        return [re.compile(pattern) for pattern in patterns]
+    except (ValueError, TypeError, re.error) as error:
+        raise ToolError(
+            f"exclude de mypy inválido en {config}: {error}"
+        ) from error
+
+
+def mypy_excluded(
+    path: Path, folder: Path, config: Path, exclude: list[re.Pattern[str]]
+) -> bool:
+    """Si mypy dejaría fuera este archivo al recorrer la carpeta.
+
+    Como mypy: cada carpeta bajo la del microservicio (con '/' al final) y el
+    archivo, relativos a donde está el pyproject, contra cada patrón con
+    re.search. mypy no aplica exclude a los archivos que recibe uno por uno,
+    así que se filtran antes de pasárselos.
+    """
+    candidates = [path]
+    candidates.extend(
+        parent for parent in path.parents if folder in parent.parents
+    )
+    for candidate in candidates:
+        relative = os.path.relpath(candidate, config.parent)
+        relative = relative.replace(os.sep, "/")
+        if candidate != path:
+            relative += "/"
+        if any(pattern.search(relative) for pattern in exclude):
+            return True
+    return False
 
 
 # --------------------------------------------------------------------------
@@ -362,6 +447,7 @@ def run(ctx: Context) -> CheckResult:
 def check_project(root: Path, project: Project, env: Path) -> list[Finding]:
     """Los hallazgos de todos los microservicios de un proyecto."""
     config = pyproject(project.path)
+    exclude = mypy_exclude(env, config)
     findings: list[Finding] = []
     for microservice in project.microservices:
         place = Place(root, project, microservice)
@@ -371,7 +457,7 @@ def check_project(root: Path, project: Project, env: Path) -> list[Finding]:
             for finding in [
                 ruff_finding(place, ruff_check(env, files, config)),
                 format_finding(place, ruff_unformatted(env, files, config)),
-                mypy_finding(place, env, config),
+                mypy_finding(place, env, config, exclude),
                 todo_finding(place),
             ]
             if finding is not None
@@ -492,10 +578,17 @@ def format_finding(place: Place, files: list[str]) -> Finding | None:
 
 
 def mypy_finding(
-    place: Place, env: Path, config: Path | None
+    place: Place,
+    env: Path,
+    config: Path | None,
+    exclude: list[re.Pattern[str]],
 ) -> Finding | None:
     """C3: `mypy` con errores."""
-    files = list(iter_files(place.folder, (".py",)))
+    files = [
+        path
+        for path in iter_files(place.folder, (".py",))
+        if not (config and mypy_excluded(path, place.folder, config, exclude))
+    ]
     if not files:
         return None  # sin código, mypy se queja de que no hay archivos
     errors = mypy_errors(env, files, config)
@@ -577,11 +670,14 @@ def apply_ruff(
     try:
         env = ensure_tools(project_versions(project))
         before = fingerprint(folder)
-        config = ruff_config(pyproject(project))
+        config = pyproject(project)
         files = ruff_files(folder)
         if files:
             run_tool(
-                env, ["ruff", *args, "--no-cache", *config, *files], ok=(0, 1)
+                env,
+                ["ruff", *args, "--no-cache", *ruff_config(config), *files],
+                ok=(0, 1),
+                cwd=ruff_cwd(env, config),
             )
     except ToolError as error:
         raise seedflow.SeedError(str(error)) from error
@@ -591,7 +687,9 @@ def apply_ruff(
 
 def fix_ruff_check(root: Path, fix_id: str) -> list[Path]:
     """C1: `ruff check --fix` (solo los arreglos seguros de ruff)."""
-    return apply_ruff(root, fix_id, "C1", ["check", "--fix"])
+    return apply_ruff(
+        root, fix_id, "C1", ["check", "--fix", "--no-unsafe-fixes"]
+    )
 
 
 def fix_ruff_format(root: Path, fix_id: str) -> list[Path]:

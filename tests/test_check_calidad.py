@@ -55,6 +55,10 @@ from pathlib import Path
 
 env = Path(__file__).resolve().parent
 args = sys.argv[1:]
+if args[0] == "-c":  # un script de seedflow que corre con este python
+    sys.argv = ["-c", *args[2:]]
+    exec(compile(args[1], "<seedflow>", "exec"))
+    sys.exit(0)
 tool = args[1]
 with (env / "calls.jsonl").open("a", encoding="utf-8") as log:
     log.write(json.dumps({"argv": args, "cwd": os.getcwd()}) + "\n")
@@ -86,7 +90,13 @@ def rewrite(marker):
 
 
 if tool == "ruff" and args[2] == "check":
-    if "--fix" in args:
+    # Como ruff: arregla con --fix, o si el pyproject dice fix / fix-only y
+    # no se le pasa --no-fix / --no-fix-only.
+    config = args[args.index("--config") + 1] if "--config" in args else None
+    settings = Path(config).read_text() if config else ""
+    if ("--fix" in args
+            or ("\nfix = true" in settings and "--no-fix" not in args)
+            or ("fix-only = true" in settings and "--no-fix-only" not in args)):
         rewrite("ERR_RUFF_FIX")
     found = []
     for path in files:
@@ -274,6 +284,39 @@ class CalidadTestCase(unittest.TestCase):
     def default_env(self):
         return self.tools / "ruff-0.9.6_mypy-1.15.0"
 
+    def configure(self, section, line, project="demo"):
+        """Agrega una línea a una sección del pyproject del proyecto."""
+        path = self.root / "projects" / project / "python" / "pyproject.toml"
+        text = path.read_text()
+        header = f"[{section}]\n"
+        self.assertIn(header, text)
+        path.write_text(text.replace(header, header + line + "\n", 1))
+
+    def snapshot(self):
+        """Contenido y fecha de todo lo que hay en el repo."""
+        result = {}
+        for path in sorted(self.root.rglob("*")):
+            content = (hashlib.sha256(path.read_bytes()).hexdigest()
+                       if path.is_file() else None)
+            result[path.relative_to(self.root).as_posix()] = (
+                path.lstat().st_mtime_ns, content
+            )
+        return result
+
+    def use_real_tools(self):
+        """ruff 0.9.6 y mypy 1.15.0 de verdad, ya instalados (sin internet).
+
+        SEEDFLOW_TEST_REAL_TOOLS apunta a un entorno de herramientas creado
+        por seedflow (p. ej. ~/.cache/seedflow/tools/ruff-0.9.6_mypy-1.15.0).
+        Sin ella, estos tests se saltan.
+        """
+        real = os.environ.get("SEEDFLOW_TEST_REAL_TOOLS")
+        if not real or not (Path(real) / "bin" / "python").exists():
+            self.skipTest("SEEDFLOW_TEST_REAL_TOOLS no apunta a ruff/mypy reales")
+        self.tools.mkdir(parents=True, exist_ok=True)
+        self.default_env().symlink_to(Path(real), target_is_directory=True)
+        self.use_installer(FakeInstaller(fail="pip"))  # nunca instala
+
 
 class InstalacionTest(CalidadTestCase):
     def test_instala_herramientas_una_sola_vez(self):
@@ -447,8 +490,13 @@ class ReglasTest(CalidadTestCase):
                 [str(p) for p in sorted(self.microservice().rglob("*.py"))],
             )
             self.assertNotIn(str(self.microservice()), argv)
-            self.assertNotIn(str(self.root), call["cwd"])
+            # Corre donde está el pyproject: sus rutas relativas (exclude,
+            # per-file-ignores) se resuelven desde ahí, como en el proyecto.
+            self.assertEqual(call["cwd"], str(self.root / "projects/demo/python"))
         self.assertIn("--check", ruff[1]["argv"])
+        # Calificar nunca arregla, aunque el pyproject lo pida.
+        for flag in ["--no-fix", "--no-fix-only", "--no-unsafe-fixes"]:
+            self.assertIn(flag, ruff[0]["argv"])
 
     def test_sin_pyproject_ruff_y_mypy_no_leen_configuracion_ajena(self):
         self.create("demo")
@@ -459,6 +507,7 @@ class ReglasTest(CalidadTestCase):
             if argv[1] == "ruff":
                 self.assertIn("--isolated", argv)
                 self.assertNotIn("--config", argv)
+                self.assertNotIn(str(self.root), call["cwd"])
             else:
                 self.assertIn("--config-file=", argv)
 
@@ -556,6 +605,11 @@ class ReglasTest(CalidadTestCase):
 
         touched = self.calidad.FIXES["C1"](self.root, finding["fix_id"])
         self.assertEqual(touched, [self.microservice() / "src/service/extra.py"])
+        # Solo arreglos seguros, desde la carpeta del pyproject.
+        fix = self.tool_calls()[-1]
+        self.assertIn("--fix", fix["argv"])
+        self.assertIn("--no-unsafe-fixes", fix["argv"])
+        self.assertEqual(fix["cwd"], str(self.root / "projects/demo/python"))
         report = self.report()
         [finding] = [f for f in self.findings(report, "C1")
                      if f["path"] == ORDERS]
@@ -710,6 +764,134 @@ class ReglasTest(CalidadTestCase):
         self.assertEqual(code, 0, err)
         self.assertIn("C2:demo/internal-services/orders", out)
         self.assertEqual(snapshot(), before)
+
+
+    def test_calificar_no_arregla_aunque_el_pyproject_lo_pida(self):
+        for setting in ["fix = true", "fix-only = true"]:
+            with self.subTest(pyproject=setting):
+                project = "fix" if setting.startswith("fix =") else "fixonly"
+                self.create(project)
+                self.configure("tool.ruff", setting, project)
+                code = self.add_code(self.errors("ERR_RUFF_FIX", 2),
+                                     project=project)
+                before = code.read_bytes()
+                report = self.report()
+                self.assertEqual(code.read_bytes(), before)
+                [finding] = [f for f in self.findings(report, "C1")
+                             if f["project"] == project]
+                self.assertEqual(finding["points"], 4)
+
+    def test_mypy_respeta_exclude_del_proyecto(self):
+        self.create("demo")
+        # Rutas desde python/, donde está el pyproject (como al correr mypy ahí).
+        self.configure(
+            "tool.mypy",
+            'exclude = ["internal-services/orders/src/generated/", '
+            "'^internal-services/orders/src/viejo\\.py$']",  # literal TOML
+        )
+        self.add_code(self.errors("ERR_MYPY", 2),
+                      filename="src/generated/g.py")
+        self.add_code(self.errors("ERR_MYPY", 1), filename="src/viejo.py")
+        self.add_code(self.errors("ERR_MYPY", 1), filename="src/sub/viejo.py")
+        self.add_code(self.errors("ERR_MYPY", 1))
+        report = self.report()
+        [finding] = self.findings(report, "C3")
+        self.assertEqual(finding["points"], 4)
+        self.assertNotIn("generated", finding["message"])
+        self.assertIn("src/sub/viejo.py", finding["message"])
+        self.assertNotIn(": src/viejo.py", finding["message"])
+        [mypy] = [c for c in self.tool_calls() if c["argv"][1] == "mypy"]
+        self.assertFalse([a for a in mypy["argv"] if "generated" in a])
+
+    def test_exclude_de_mypy_invalido_deja_el_proyecto_sin_evaluar(self):
+        self.create("demo")
+        self.configure("tool.mypy", 'exclude = ["(sin cerrar"]')
+        score, reason = self.calidad_of(self.report())
+        self.assertIsNone(score)
+        self.assertIn("exclude de mypy", reason)
+
+    def test_exclude_de_mypy_como_texto_y_sin_exclude(self):
+        self.create("demo")
+        self.add_code(self.errors("ERR_MYPY", 1), filename="src/gen/g.py")
+        self.add_code(self.errors("ERR_MYPY", 1))
+        report = self.report()
+        self.assertEqual(self.findings(report, "C3")[0]["points"], 4)
+        # Un solo patrón como texto; "/$" solo calza con carpetas, que mypy
+        # compara con "/" al final.
+        self.configure("tool.mypy", 'exclude = "/gen/$"')
+        [finding] = self.findings(self.report(), "C3")
+        self.assertEqual(finding["points"], 2)
+        self.assertNotIn("gen/", finding["message"])
+
+
+class HerramientasRealesTest(CalidadTestCase):
+    """Regresiones que dependen de cómo se comportan ruff y mypy de verdad."""
+
+    def setUp(self):
+        super().setUp()
+        self.use_real_tools()
+
+    def test_fix_en_el_pyproject_no_cambia_el_codigo_al_calificar(self):
+        for setting in ["fix = true", "fix-only = true"]:
+            with self.subTest(pyproject=setting):
+                project = "fix" if setting.startswith("fix =") else "fixonly"
+                self.create(project)
+                self.configure("tool.ruff", setting, project)
+                code = self.add_code('"""Extra."""\n\nimport os\n',
+                                     project=project)
+                before = self.snapshot()
+                report = self.report()
+                self.assertEqual(self.snapshot(), before)
+                [finding] = [f for f in self.findings(report, "C1")
+                             if f["project"] == project]
+                self.assertEqual(finding["points"], 2)
+                self.assertIn("F401", finding["message"])
+                self.assertIn(b"import os", code.read_bytes())
+
+    def test_exclusion_relativa_de_ruff_en_calificacion_y_arreglos(self):
+        self.create("demo")
+        path = self.root / "projects/demo/python/pyproject.toml"
+        text = path.read_text()
+        self.assertIn('extend-exclude = ["tests", "test"]', text)
+        path.write_text(text.replace(
+            'extend-exclude = ["tests", "test"]',
+            'extend-exclude = ["tests", "test", '
+            '"internal-services/orders/src/generated/**"]',
+        ))
+        generated = self.add_code("import os\nx={'a':1}\n",
+                                  filename="src/generated/g.py")
+        extra = self.add_code('"""Extra."""\n\nimport os\ny={"a":1}\n')
+        before = self.snapshot()
+        report = self.report()
+        self.assertEqual(self.snapshot(), before)
+        [c1] = self.findings(report, "C1")
+        self.assertEqual(c1["points"], 2)  # solo el F401 de extra.py
+        self.assertNotIn("generated", c1["message"])
+        [c2] = self.findings(report, "C2")
+        self.assertIn("1 archivo", c2["message"])
+        generated_before = generated.read_bytes()
+        for prefix in ["C1", "C2"]:
+            touched = self.calidad.FIXES[prefix](
+                self.root, f"{prefix}:demo/internal-services/orders"
+            )
+            self.assertEqual(touched, [extra])
+        self.assertEqual(generated.read_bytes(), generated_before)
+        self.assertEqual(self.findings(self.report()), [])
+
+    def test_mypy_respeta_exclude_del_proyecto_con_mypy_real(self):
+        self.create("demo")
+        self.configure(
+            "tool.mypy", 'exclude = ["internal-services/orders/src/generated/"]'
+        )
+        self.add_code('x: int = "uno"\n', filename="src/generated/g.py")
+        self.add_code('"""Extra."""\n\ny: int = "uno"\n')
+        before = self.snapshot()
+        report = self.report()
+        self.assertEqual(self.snapshot(), before)
+        [finding] = self.findings(report, "C3")
+        self.assertEqual(finding["points"], 2)
+        self.assertEqual(finding["message"],
+                         "mypy encontró 1 error: src/service/extra.py:3")
 
 
 class ContratoTest(CalidadTestCase):
