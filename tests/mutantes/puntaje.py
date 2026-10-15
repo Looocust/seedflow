@@ -5,6 +5,7 @@ la suite tiene que ponerse en rojo.
 """
 
 TARGET = "plugins/seedflow/scripts/checks/__init__.py"
+TESTS = ['test_check_puntaje']
 
 # (qué se rompe, [(texto original, texto roto), ...])
 MUTANTES = [

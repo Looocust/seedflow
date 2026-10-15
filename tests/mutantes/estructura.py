@@ -5,6 +5,7 @@ la suite tiene que ponerse en rojo.
 """
 
 TARGET = "plugins/seedflow/scripts/checks/estructura.py"
+TESTS = ['test_check_estructura']
 
 # (qué se rompe, [(texto original, texto roto), ...])
 MUTANTES = [

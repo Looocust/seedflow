@@ -6,6 +6,7 @@ de la carpeta temporal de los tests.
 """
 
 TARGET = "plugins/seedflow/scripts/checks/calidad.py"
+TESTS = ['test_check_calidad']
 
 # (qué se rompe, [(texto original, texto roto), ...])
 MUTANTES = [
