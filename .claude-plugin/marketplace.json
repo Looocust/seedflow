@@ -8,7 +8,7 @@
     {
       "name": "seedflow",
       "source": "./plugins/seedflow",
-      "description": "Crea proyectos y microservicios con la estructura de Melonn: hace las preguntas, arma la estructura con un script y deja el código conectado a las librerías lib-python-*."
+      "description": "Crea proyectos y microservicios con la estructura de Melonn: hace las preguntas, arma la estructura con un script y deja el código conectado a las librerías lib-python-*. También califica qué tan ordenado está el repo y ofrece arreglos."
     }
   ]
 }

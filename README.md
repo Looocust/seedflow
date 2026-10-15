@@ -3,11 +3,13 @@
 Plugin de Claude Code para crear proyectos y microservicios con la estructura de
 Melonn. Reemplaza a `melonn-python-cli`: hace las mismas preguntas, pero en el
 chat, y además deja el código del microservicio conectado a las librerías
-`lib-python-*`.
+`lib-python-*`. También califica de 0 a 100 qué tan ordenado está el repo y
+ofrece arreglar lo que es mecánico.
 
 ```
 /seedflow:crear-proyecto  →  /seedflow:crear-microservicio  →  a programar
                                                                /seedflow:eliminar
+                                                               /seedflow:revisar
 ```
 
 ## Contenido
@@ -19,11 +21,12 @@ chat, y además deja el código del microservicio conectado a las librerías
 5. [Cómo probarlo](#5-cómo-probarlo)
 6. [El script sin Claude](#6-el-script-sin-claude)
 7. [Qué se genera](#7-qué-se-genera)
-8. [Garantías y límites](#8-garantías-y-límites)
-9. [Errores comunes](#9-errores-comunes)
-10. [Actualizar y desinstalar](#10-actualizar-y-desinstalar)
-11. [Desarrollo](#11-desarrollo)
-12. [Diferencias con melonn-python-cli](#12-diferencias-con-melonn-python-cli)
+8. [Calificación](#8-calificación)
+9. [Garantías y límites](#9-garantías-y-límites)
+10. [Errores comunes](#10-errores-comunes)
+11. [Actualizar y desinstalar](#11-actualizar-y-desinstalar)
+12. [Desarrollo](#12-desarrollo)
+13. [Diferencias con melonn-python-cli](#13-diferencias-con-melonn-python-cli)
 
 ---
 
@@ -33,8 +36,8 @@ Dos piezas:
 
 | Pieza | Qué hace | Dónde está |
 |---|---|---|
-| **El script** | Crea y borra carpetas y archivos. Es determinista: el mismo comando da la misma estructura para todo el equipo. Solo usa la librería estándar de Python. No hace preguntas. | `plugins/seedflow/scripts/seedflow.py` |
-| **Las skills** | Hacen las preguntas en el chat, confirman, llaman al script y después escriben lo que el script no puede saber: el handler conectado al servicio, los imports de cada librería, el evento de ejemplo y las variables de entorno. | `plugins/seedflow/skills/` |
+| **El script** | Crea y borra carpetas y archivos, califica el repo (`check`) y aplica los arreglos mecánicos (`fix`). Es determinista: el mismo comando da la misma estructura y la misma nota para todo el equipo. Solo usa la librería estándar de Python. No hace preguntas. | `plugins/seedflow/scripts/seedflow.py` y las reglas en `plugins/seedflow/scripts/checks/` |
+| **Las skills** | Hacen las preguntas en el chat, confirman, llaman al script y después escriben lo que el script no puede saber: el handler conectado al servicio, los imports de cada librería, el evento de ejemplo y las variables de entorno. `revisar` muestra la nota, agrega lo que solo Claude puede ver y ofrece los arreglos. | `plugins/seedflow/skills/` |
 
 Las plantillas que se copian están en `plugins/seedflow/templates/`, y la
 información que usan las skills (estructura y librerías), en
@@ -49,7 +52,8 @@ información que usan las skills (estructura y librerías), en
 | [Claude Code](https://claude.com/claude-code) | Usar las skills | Sí (el script funciona sin él) |
 | Python 3.8 o superior | Correr el script | Sí |
 | Node.js + AWS CDK (`npm install -g aws-cdk`) | Inicializar `iac/` | No: sin CDK, el proyecto se crea con `iac/` vacía (`--skip-cdk`) |
-| git | Que `/seedflow:eliminar` avise de cambios sin commitear | Recomendado |
+| git | Que `/seedflow:eliminar` avise de cambios sin commitear y que la calificación revise si hay un `.env` commiteado | Recomendado |
+| Internet la primera vez que se califica la calidad de código | Instalar `ruff` y `mypy` en un entorno propio de seedflow (ver [ruff y mypy](#ruff-y-mypy)) | No: sin internet, la calidad de código queda "no evaluada" y el resto se califica igual |
 | Acceso a `we-are-melonn` en GitHub | Instalar las `lib-python-*` en los proyectos generados | Solo para correr los proyectos, no para el plugin |
 | Python 3.12 | Correr los proyectos generados | Solo para los proyectos |
 
@@ -129,11 +133,11 @@ después de cada `git pull`.
 
 ```bash
 claude plugin list                 # debe aparecer seedflow@looocust (enabled)
-claude plugin details seedflow     # debe decir Skills (3)
+claude plugin details seedflow     # debe decir Skills (4)
 ```
 
 Si dice `Skills (0)`, el plugin se instaló pero no cargó sus skills: revisa
-[Errores comunes](#9-errores-comunes).
+[Errores comunes](#10-errores-comunes).
 
 ---
 
@@ -151,9 +155,17 @@ microservicio que lea de Redshift"), o directamente con su comando:
 | `/seedflow:crear-proyecto [nombre]` | Proyecto nuevo: `deployment-scripts/`, `iac/` con AWS CDK y `python/` |
 | `/seedflow:crear-microservicio [nombre y qué hace]` | Microservicio nuevo dentro de un proyecto, con el código conectado a las librerías |
 | `/seedflow:eliminar proyecto <nombre>`<br>`/seedflow:eliminar microservicio <nombre>` | Borrar, mostrando antes qué se pierde |
+| `/seedflow:revisar` | Calificar qué tan ordenado está el repo, ver qué arreglar y por qué, y aplicar los arreglos que aceptes |
 
 La forma corta (`/crear-proyecto`) también funciona mientras ningún otro plugin
 use ese nombre.
+
+Las tres primeras terminan con una línea de resumen de la nota del repo (ver
+[Calificación](#8-calificación)):
+
+```
+data-hub: 92/100 🟢 · 3 cosas por mejorar (sin calidad de código) · detalle: /seedflow:revisar
+```
 
 ### `/seedflow:crear-proyecto`
 
@@ -226,6 +238,29 @@ Si ya lo describiste, deduce las respuestas y no las pregunta. Después:
 3. Pregunta "No, cancelar" / "Sí, borrar". Solo borra con un sí a esa pregunta:
    un "ya lo confirmé" dentro del mismo pedido no cuenta.
 
+### `/seedflow:revisar`
+
+```
+/seedflow:revisar
+```
+
+También se activa con frases como "¿qué tan ordenado está esto?", "califica el
+repo" o "revisa el proyecto".
+
+1. Califica el repo completo, con las cuatro categorías. La primera vez instala
+   `ruff` y `mypy` (cerca de un minuto, con internet) y te avisa antes.
+2. Muestra la nota del repo, la de cada proyecto y categoría con su semáforo, y
+   cada hallazgo con la ruta, los puntos, por qué importa y cómo arreglarlo.
+3. Agrega, en una sección aparte, observaciones de Claude: lo que ninguna regla
+   puede juzgar (por ejemplo, lógica de negocio metida en el handler). **No
+   cambian la nota.**
+4. Ofrece los arreglos mecánicos, con la lista exacta de archivos que toca cada
+   uno, y los aplica solo con un sí a esa pregunta. Para un `.env` commiteado o
+   un `iac/.git` anidado ofrece opciones aparte, cada una con su confirmación.
+5. Si aplicó algo, vuelve a calificar y muestra la nota nueva.
+
+Si dices que no a todo, el repo queda exactamente igual: calificar solo lee.
+
 ---
 
 ## 5. Cómo probarlo
@@ -267,7 +302,7 @@ Escribe cada mensaje en Claude Code y revisa el resultado esperado.
 
 | # | Escribe | Resultado esperado |
 |---|---|---|
-| 1 | `/seedflow:` (sin enviar) | El autocompletado muestra `crear-proyecto`, `crear-microservicio` y `eliminar` |
+| 1 | `/seedflow:` (sin enviar) | El autocompletado muestra `crear-proyecto`, `crear-microservicio`, `eliminar` y `revisar` |
 | 2 | `necesito arrancar un proyecto nuevo para forecast de inventario` | Se activa `crear-proyecto` sola: te dice dónde va a crear y pregunta el tipo de servicio. Cancela ahí |
 | 3 | `/seedflow:crear-proyecto prueba-seedflow` → `internal-services` → sí al microservicio → `ventas-diarias`, sin database, "lee de S3 y escribe en Redshift" | Se crea `projects/prueba-seedflow/` y el microservicio. En `iac/bin/` hay un `prueba-seedflow.ts` con `PruebaSeedflowStack` |
 | 4 | `/seedflow:crear-microservicio alertas-stock en prueba-seedflow: consulta Aurora y avisa a Slack si falla` | En `layers/requirements.txt` están mysql-connector, slack-notifier y custom-errors. Hay `TODO` donde va la query. `SLACK_CHANNEL` está en `.env.example` |
@@ -276,6 +311,9 @@ Escribe cada mensaje en Claude Code y revisa el resultado esperado.
 | 7 | (responde) **Sí, borrar** | Borra la carpeta y quita `alertas-stock` de `python/.vscode/launch.json` |
 | 8 | `borra el proyecto ..` | Se niega: el nombre no es válido |
 | 9 | `/seedflow:crear-proyecto prueba-seedflow` | Se niega: el proyecto ya existe |
+| 10 | (mira el final de los escenarios 3, 4 y 7) | Cada uno cierra con la línea `data-hub: NN/100 … · detalle: /seedflow:revisar` |
+| 11 | `¿qué tan ordenado está esto?` → di **no** a todos los arreglos | Se activa `revisar`: nota del repo, de cada proyecto y categoría, hallazgos con su porqué y observaciones aparte. `git status` queda igual que antes |
+| 12 | Borra `events/ventas-diarias.json` del escenario 3, `/seedflow:revisar` → acepta el arreglo del evento | Crea el archivo con `{}`, vuelve a calificar y estructura sube 3 puntos |
 
 Además, desde la terminal:
 
@@ -304,7 +342,9 @@ error del script), y abre un issue en
 ## 6. El script sin Claude
 
 El script se puede usar solo, desde una terminal, por ejemplo en CI o si no usas
-Claude Code. **No hace preguntas**: todo va por argumentos.
+Claude Code. **No hace preguntas**: todo va por argumentos. Comandos: `status`,
+`create-project`, `create-microservice`, `delete-project`,
+`delete-microservice`, `check` y `fix`.
 
 ### Dónde está
 
@@ -410,13 +450,115 @@ python3 $S delete-microservice orders-sync --project stock-forecast --service-ty
 python3 $S delete-microservice orders-sync --project stock-forecast --service-type internal-services --yes
 ```
 
+### `check`
+
+Califica el repo de 0 a 100 (cómo se calcula: [Calificación](#8-calificación)).
+**Solo lee**: nunca escribe en el repo.
+
+```bash
+python3 $S check [--quick] [--json]
+```
+
+| Opción | Qué hace |
+|---|---|
+| (ninguna) | Reporte completo: las cuatro categorías, nota por proyecto y cada hallazgo con su porqué, cómo arreglarlo y si seedflow puede hacerlo. La primera vez instala `ruff` y `mypy` (ver [ruff y mypy](#ruff-y-mypy)) |
+| `--quick` | Una sola línea, solo con las reglas rápidas: sin calidad de código, sin `ruff`, `mypy` ni red. Es la que muestran las skills al terminar |
+| `--json` | Salida en JSON: `root`, `score`, `semaphore`, `projects` (cada uno con `name`, `score`, `categories` con la nota de cada categoría o `null` si no se evaluó, y `not_evaluated` con el motivo) y `findings` (cada hallazgo con `category`, `rule`, `points`, `project`, `path`, `message`, `why`, `how` y `fix_id`, que es `null` si no tiene arreglo). Se combina con `--quick` |
+
+Ejemplo: un repo con un proyecto al que le falta el evento de prueba, con una
+librería en `@main` y con un `.gitignore` que no ignora `.env`:
+
+```bash
+python3 $S check --quick
+```
+
+```
+data-hub: 92/100 🟢 · 3 cosas por mejorar (sin calidad de código) · detalle: /seedflow:revisar
+```
+
+```bash
+python3 $S check
+```
+
+Con `ruff` y `mypy` ya instalados (el porqué y el cómo de D1 van recortados):
+
+```
+📊 data-hub: 94/100 🟢 · 3 cosas por mejorar
+
+📁 stock-forecast: 94/100 🟢
+   - estructura: 97/100
+   - calidad de código: 100/100
+   - dependencias: 90/100
+   - seguridad e higiene: 90/100
+   ❗ [E3] -3 · projects/stock-forecast/python/internal-services/orders-sync/events/orders-sync.json
+      Falta el evento de prueba events/orders-sync.json.
+      Por qué: Sin evento de prueba no se puede correr el handler en local ni desde VS Code.
+      Cómo: Crea el archivo con {} y completa el evento que recibe la Lambda. (seedflow puede hacerlo (fix E3:stock-forecast/internal-services/orders-sync))
+   ❗ [D1] -10 · projects/stock-forecast/python/internal-services/orders-sync/layers/requirements.txt
+      lib-python-melogger está con @main (línea 2: git+https://github.com/we-are-melonn/lib-python-melogger.git@main)
+      Por qué: Sin un SHA fijo, cada despliegue instala lo último de la rama: …
+      Cómo: Fija el commit: … (a mano)
+   ❗ [H2] -10 · .gitignore
+      El .gitignore de la raíz no ignora el .env de este proyecto (python/.env).
+      Por qué: Un .env con credenciales se puede commitear sin que nadie lo note.
+      Cómo: Agrega la línea .env al .gitignore de la raíz. (seedflow puede hacerlo (fix H2:.gitignore))
+```
+
+La línea rápida da 92 y el reporte 94 porque la línea no incluye calidad de
+código: promedia tres categorías (97, 90 y 90) y el reporte cuatro (97, 100, 90
+y 90).
+
+```bash
+python3 $S check --json            # el reporte completo, en JSON
+python3 $S check --quick --json    # sin calidad de código: "calidad": null
+python3 $S --root ~/data-hub check --quick   # otro repo, sin moverte
+```
+
+Si la carpeta no tiene `projects/`, no hay nota y lo dice
+(`data-hub: no encontré proyectos en …/projects, así que no hay nota.`); con
+`--json`, `score` y `semaphore` son `null` y `projects` está vacía. Las dos
+salen con código 0.
+
+### `fix`
+
+Aplica los arreglos mecánicos que ofrece `check` (cuáles son:
+[Arreglos](#arreglos)). Nunca borra archivos.
+
+```bash
+python3 $S fix --list
+python3 $S fix FIX_ID [FIX_ID ...]
+```
+
+| Opción | Qué hace |
+|---|---|
+| `--list` | Muestra cada arreglo disponible ahora (`fix_id`), qué hace y los archivos que tocaría. No cambia nada. Califica con las cuatro categorías, así que puede instalar `ruff` y `mypy` la primera vez |
+| `FIX_ID ...` | Aplica solo esos arreglos e imprime los archivos que tocó. Antes de aplicar el primero, comprueba que todos estén entre los que ofrece `check`: si uno no está, falla sin aplicar ninguno. Un id repetido se aplica una vez, y `C1` va antes que `C2` |
+| (sin opciones) | No hace nada y lo dice |
+
+Los ids salen del reporte (`fix E3:…`), del campo `fix_id` de `check --json` o
+de `fix --list`:
+
+```bash
+python3 $S fix --list
+python3 $S fix E3:stock-forecast/internal-services/orders-sync H2:.gitignore
+python3 $S check --quick    # el hallazgo ya no aparece y la nota sube lo que descontaba
+```
+
+`fix` sale con código 1 (mensaje con ❌, sin traceback) si un id no existe o no
+está entre los que ofrece `check`, o si un arreglo no se puede aplicar (por
+ejemplo, `.gitignore` es un enlace o `launch.json` tiene comentarios). Si un
+arreglo falla a mitad de una lista, los anteriores quedan aplicados y el
+mensaje dice cuáles.
+
 ### Códigos de salida
 
 | Código | Significa |
 |---|---|
-| `0` | Todo bien (incluye `--dry-run`) |
-| `1` | Error esperado: nombre inválido, ya existe, no existe, falta `--yes`, falló `cdk`. El mensaje sale por stderr, empieza con ❌ y no muestra traceback |
-| `2` | Argumentos mal escritos: falta uno obligatorio, tipo de servicio inválido, `--dry-run` junto con `--yes` |
+| `0` | Todo bien (incluye `--dry-run`, `check` con cualquier nota o sin proyectos, y `fix` sin ids) |
+| `1` | Error esperado: nombre inválido, ya existe, no existe, falta `--yes`, falló `cdk`, un `fix_id` que no existe o un arreglo que no se pudo aplicar. El mensaje sale por stderr, empieza con ❌ y no muestra traceback |
+| `2` | Argumentos mal escritos: falta uno obligatorio, tipo de servicio inválido, `--dry-run` junto con `--yes`, una opción que no existe |
+
+`check` no falla por una nota baja: solo informa.
 
 ---
 
@@ -460,7 +602,248 @@ de cada librería (import, firma, variables de entorno), en
 
 ---
 
-## 8. Garantías y límites
+## 8. Calificación
+
+seedflow califica de 0 a 100 qué tan ordenado está un repo de Melonn (data-hub,
+ds-core…) en cuatro categorías: **estructura**, **calidad de código**,
+**dependencias** y **seguridad e higiene**. Cada proyecto de `projects/` tiene
+su nota y el repo tiene la nota promedio. Cada punto que se descuenta dice por
+qué y cómo arreglarlo. Sirve para ver qué proyectos se están desviando del
+estándar sin revisarlos a mano: los creados con el CLI anterior arrastran
+problemas (la ruta de eventos rota, `iac/.git`, `IacStack`, librerías sin
+fijar) que así quedan a la vista.
+
+La calificación **solo informa**: no bloquea commits, CI ni la creación de
+proyectos, y calificar nunca escribe en el repo.
+
+### Cuándo aparece
+
+Solo cuando usas seedflow:
+
+| Dónde | Qué muestra |
+|---|---|
+| Al terminar `crear-proyecto`, `crear-microservicio` y `eliminar` | Una línea con la nota del repo, cuántas cosas hay por mejorar y dónde ver el detalle. Usa solo las reglas rápidas: sin calidad de código, y lo dice. Tarda menos de 2 segundos |
+| `/seedflow:revisar` (o "¿qué tan ordenado está esto?") | El reporte completo con las cuatro categorías, las observaciones de Claude y los arreglos que puede hacer |
+| `seedflow.py check` en una terminal | Lo mismo, sin Claude (ver [`check`](#check)) |
+
+```
+data-hub: 92/100 🟢 · 3 cosas por mejorar (sin calidad de código) · detalle: /seedflow:revisar
+```
+
+### Cómo se calcula la nota
+
+Cada hallazgo (una regla incumplida en un lugar concreto) descuenta puntos
+según su gravedad:
+
+| Gravedad | Descuenta |
+|---|---|
+| Crítico | 25 |
+| Importante | 10 |
+| Menor | 3 |
+| Errores de `ruff check` o `mypy` | 2 por error, máximo 30 por herramienta y microservicio |
+| Aviso | 0 (ver [Avisos de 0 puntos](#avisos-de-0-puntos)) |
+
+- **Categoría** = 100 − la suma de los descuentos de sus hallazgos en ese
+  proyecto, sin bajar de 0.
+- **Proyecto** = promedio de sus categorías evaluadas, todas con el mismo peso.
+- **Repo** = promedio de las notas de sus proyectos.
+- Se redondea al entero más cercano, con `.5` hacia arriba: 74,5 da 75 🟢.
+
+| Semáforo | Nota |
+|---|---|
+| 🟢 | 75 o más |
+| 🟡 | de 50 a 74 |
+| 🔴 | menos de 50 |
+
+Ejemplo (el de [`check`](#check)): estructura 97, calidad de código 100,
+dependencias 90 y seguridad e higiene 90 dan (97 + 100 + 90 + 90) / 4 = 94,25 →
+**94** 🟢. La línea rápida no tiene calidad de código: (97 + 90 + 90) / 3 =
+92,3 → **92** 🟢.
+
+La nota es reproducible: la misma copia del repo da la misma nota en cada
+corrida y en cada máquina. Por eso las observaciones de Claude no la cambian y
+`ruff` y `mypy` corren en versiones fijas.
+
+### Categorías "no evaluadas"
+
+Una categoría que no se pudo calcular se muestra como `no evaluada (motivo)`
+(`null` en `--json`) y **no entra en el promedio**: no suma ni resta. Si un
+proyecto no tiene ninguna categoría evaluada, queda "sin nota".
+
+| Motivo | Categoría |
+|---|---|
+| `no se revisa en la línea de resumen` | Calidad de código, en la línea rápida (`--quick`) |
+| `el proyecto no tiene microservicios` | Calidad de código: no hay código que revisar |
+| `no se pudieron instalar ruff … y mypy … (…); se necesita internet la primera vez` | Calidad de código: sin internet o sin `pip` |
+| `ruff falló (código N): …`, `mypy falló …`, `… no respondió`, `ruff devolvió algo que no es JSON` | Calidad de código: la herramienta no pudo revisar |
+| `el pyproject pide reportes de mypy (…)` o `… plugins de mypy (…)` | Calidad de código: mypy escribiría archivos o ejecutaría código del proyecto, y calificar no hace ninguna de las dos |
+| `exclude de mypy inválido en …`, `no se pudo leer [tool.mypy] de …` | Calidad de código: el `pyproject.toml` del proyecto tiene un problema |
+
+### Avisos de 0 puntos
+
+Cuando una regla no se puede revisar en un lugar, en vez de descontar o callar
+deja un **aviso**: un hallazgo de 0 puntos que dice qué no se revisó y cómo
+revisarlo a mano. Pasa en tres casos:
+
+- **Rutas enlazadas** (enlaces simbólicos o junctions de Windows) dentro de un
+  proyecto: lo que hay detrás no es parte del repo, así que no se mira
+  (reglas E1, E2, E3 y E7).
+- **`launch.json` con comentarios u otra forma**, o enlazado: la regla E4 no
+  se evalúa en ese proyecto.
+- **La carpeta no es un repo git** (o git no está instalado): no se puede saber
+  si hay un `.env` commiteado (regla H1), y se avisa en cada proyecto.
+
+Los avisos **no bajan la nota**, pero sí cuentan como "cosa por mejorar" en la
+línea rápida, para que no pasen desapercibidos. Por ejemplo, un proyecto
+recién creado en una carpeta sin git:
+
+```
+sin-git: 100/100 🟢 · 1 cosa por mejorar (sin calidad de código) · detalle: /seedflow:revisar
+```
+
+### Reglas
+
+Las reglas viven en `plugins/seedflow/scripts/checks/`, un módulo por
+categoría. "Arreglo" indica si seedflow puede arreglarlo solo (ver
+[Arreglos](#arreglos)).
+
+**Estructura** (`checks/estructura.py`)
+
+| Regla | Qué revisa | Descuenta | Arreglo |
+|---|---|---|---|
+| E1 | Al proyecto le falta `deployment-scripts/`, `iac/` o `python/` | 10 por carpeta | No |
+| E2 | Al microservicio le falta `events/`, `layers/requirements.txt`, `src/handler.py` o `src/service/` | 10 por cada una | No |
+| E3 | Falta el evento de prueba `events/<microservicio>.json` (o es una carpeta) | 3 | Sí: lo crea con `{}` (si es una carpeta, no) |
+| E4 | `python/.vscode/launch.json` no tiene la entrada de un microservicio, o tiene una de un microservicio que no existe | 3 por entrada | Sí: agrega o quita esa entrada |
+| E5 | El handler busca el evento en `../../events` (la ruta rota del CLI anterior) | 10 | Sí: cambia solo ese texto por `../events` |
+| E6 | `iac/` tiene un repo git anidado (`iac/.git`) | 10 | No: [opciones](#arreglos) en `/seedflow:revisar` |
+| E7 | El stack de CDK se llama `IacStack` (en `iac/bin/*.ts` o `iac/lib/*-stack.ts`) | 3 | No: cambiar el id del stack crea uno nuevo al desplegar |
+| E8 | Un nombre de proyecto o microservicio no cumple las reglas de seedflow | 3 por nombre | No. Mientras no cumpla, tampoco se ofrecen los arreglos E3, E4 y E5 de ese microservicio |
+
+**Calidad de código** (`checks/calidad.py`, solo en el reporte completo; por
+microservicio, con las reglas del `python/pyproject.toml` del proyecto)
+
+| Regla | Qué revisa | Descuenta | Arreglo |
+|---|---|---|---|
+| C1 | `ruff check` encuentra errores | 2 por error, máximo 30 | En parte: `ruff check --fix`, solo con los arreglos seguros de ruff. Se ofrece solo si alguno se puede arreglar así; el hallazgo dice cuántos |
+| C2 | `ruff format` cambiaría archivos | 3 | Sí: `ruff format` |
+| C3 | `mypy` encuentra errores | 2 por error, máximo 30 | No |
+| C4 | Hay `TODO` pendientes en los `.py` (la palabra en mayúsculas) | 3, uno por microservicio | No |
+
+**Dependencias** (`checks/dependencias.py`)
+
+| Regla | Qué revisa | Descuenta | Arreglo |
+|---|---|---|---|
+| D1 | Una `lib-python-*` sin `@<sha>` (sin `@`, con `@main`, otra rama, un tag o `==versión`) en `python/requirements.txt` o en un `layers/requirements.txt` | 10 por línea | No: fijar una versión es una decisión |
+| D2 | La misma librería con SHAs distintos entre el `layers/requirements.txt` de un microservicio y `python/requirements.txt` | 3 por línea | No |
+| D3 | El código de `src/` importa una librería Melonn de [`references/librerias.md`](plugins/seedflow/references/librerias.md) (`melonnRedshiftConnector`, `we_are_melonn.slack_notifier`…) cuyo repo no está en el `layers/requirements.txt` de su microservicio | 10 por librería y microservicio | No |
+
+**Seguridad e higiene** (`checks/higiene.py`)
+
+| Regla | Qué revisa | Descuenta | Arreglo |
+|---|---|---|---|
+| H1 | Un `.env` (no `.env.example`) commiteado dentro de `projects/` | 25 por archivo | No: [opciones](#arreglos) en `/seedflow:revisar`. Fuera de git, aviso de 0 puntos |
+| H2 | El `.gitignore` de la raíz no ignora el `python/.env` del proyecto | 10 en **cada** proyecto expuesto | Sí: agrega `.env` al final del `.gitignore` (lo crea si no existe) |
+| H3 | Texto con forma de credencial en un `.py`: `AKIA…` o `password`/`secret`/`token` = un texto literal | 25 por archivo | No: muévela a una variable de entorno y rótala |
+| H4 | `read`, `execute_query` o `write` con una query armada con f-string o `.format()` | 10 por archivo | No |
+
+Detalles que cambian el resultado:
+
+- H2 mira **solo** el `.gitignore` de la raíz, con las reglas de git (`**/.env`,
+  `.env*`, negaciones…). No cuentan tu gitignore global, `.git/info/exclude` ni
+  el `.gitignore` de un proyecto: así la nota es la misma en cualquier clon.
+- H3 y H4 pueden dar falsos positivos, y el hallazgo lo dice. Nunca muestran el
+  valor de una credencial: solo el archivo y las líneas.
+- Ninguna regla entra a `.venv`, `venv`, `node_modules`, `cdk.out`, `.git` ni
+  cachés, ni sigue enlaces.
+
+### Arreglos
+
+**Mecánicos.** Los que no requieren decidir nada. `/seedflow:revisar` los ofrece
+al final del reporte con la lista exacta de archivos que toca cada uno, y los
+aplica solo con un sí a esa pregunta; después vuelve a calificar. Desde la
+terminal: [`fix`](#fix).
+
+| `fix_id` | Qué hace | Toca |
+|---|---|---|
+| `E3:<proyecto>/<tipo>/<microservicio>` | Crea el evento de prueba con `{}` | `events/<microservicio>.json` |
+| `E4:<proyecto>/<tipo>/<microservicio>` | Agrega la entrada que falta o quita la huérfana | `python/.vscode/launch.json` |
+| `E5:<proyecto>/<tipo>/<microservicio>` | Cambia `../../events` por `../events`; el resto queda igual | `src/handler.py` |
+| `H2:.gitignore` | Agrega `.env` al final, sin tocar las demás líneas (uno solo para todos los proyectos) | `.gitignore` de la raíz |
+| `C1:<proyecto>/<tipo>/<microservicio>` | `ruff check --fix` con los arreglos seguros | Los archivos del microservicio que cambie |
+| `C2:<proyecto>/<tipo>/<microservicio>` | `ruff format` | Los archivos del microservicio que cambie |
+
+Un arreglo nunca borra archivos, no escribe a través de enlaces y no hace nada
+si ya está arreglado. Nunca cambia lógica de negocio, queries, versiones de
+dependencias ni el historial de git.
+
+**No mecánicos.** `/seedflow:revisar` ofrece opciones, cada una con su propia
+confirmación; `fix` no los toca:
+
+- **`.env` commiteado (H1):** dejar de seguirlo (`git rm --cached`, el archivo
+  queda en tu disco) y agregarlo al `.gitignore`, más la recomendación de
+  rotar las credenciales que tenía. Sacarlo del historial de git queda fuera.
+- **`iac/.git` anidado (E6):** moverlo a un respaldo fuera del repo, o
+  borrarlo si confirmas que no necesitas ese historial.
+
+### Observaciones de Claude
+
+En `/seedflow:revisar`, Claude agrega lo que ninguna regla automática puede
+juzgar, por ejemplo toda la lógica metida en `handler.py` con
+`service/main.py` vacío. Van en una sección aparte y **no afectan la nota**.
+
+### ruff y mypy
+
+La calidad de código necesita `ruff` y `mypy`. seedflow no usa los que tengas
+instalados (otra versión daría otra nota) ni toca tus entornos ni los del
+proyecto:
+
+- Los instala con `venv` + `pip` en un entorno propio:
+  `~/.cache/seedflow/tools/ruff-<versión>_mypy-<versión>/` (en Windows,
+  `%LOCALAPPDATA%\seedflow\tools\…`). La variable `SEEDFLOW_TOOLS_DIR`
+  reemplaza la carpeta `tools`.
+- Versiones: las que fija el proyecto en `python/requirements.txt` con `==`
+  (la plantilla de seedflow fija `ruff==0.9.6` y `mypy==1.15.0`); si no las
+  fija así, 0.9.6 y 1.15.0.
+- La primera vez necesita internet y tarda alrededor de 70 segundos. Después
+  el reporte completo tarda unos segundos. `pip` usa tu configuración (por
+  ejemplo `PIP_INDEX_URL`).
+- Solo se instala si algún proyecto tiene microservicios.
+- Para reinstalar, borra esa carpeta: la próxima calificación la crea de nuevo.
+
+Al calificar, `ruff` corre sin caché y `mypy` guarda la suya dentro del
+entorno de herramientas: no queda nada en el repo. Tampoco se ejecuta código
+del proyecto (por eso un `pyproject.toml` con plugins de mypy deja la
+categoría "no evaluada").
+
+### Fuera de alcance
+
+- **Sin historial:** no guarda notas anteriores ni muestra si subieron o
+  bajaron.
+- **No bloquea nada:** ni commits, ni CI, ni la creación de proyectos. Solo
+  informa.
+- **No revisa `iac/` ni los scripts por dentro:** no revisa el TypeScript de
+  `iac/` (salvo buscar `IacStack`) ni el contenido de `deployment-scripts/`;
+  solo que existan.
+- **Solo `projects/`:** no revisa nada fuera de esa carpeta, salvo el
+  `.gitignore` de la raíz.
+- **Arreglos solo mecánicos:** nunca cambian lógica de negocio, queries,
+  versiones de dependencias ni historial de git.
+- **Sin aviso al abrir Claude Code:** no hay hook automático al iniciar sesión.
+
+### Limitaciones conocidas
+
+- **`iac/.git` como enlace:** si `iac/.git` es un enlace simbólico (incluso
+  roto), E6 descuenta 10 puntos en vez de dar un aviso de 0 como las demás
+  rutas enlazadas.
+- **El arreglo `H2:.gitignore` no es atómico:** reescribe el `.gitignore` de
+  una vez, sin archivo temporal. Si el disco se llena justo al escribir, se
+  pierde su contenido. Si lo tienes commiteado, `git checkout -- .gitignore`
+  lo recupera.
+
+---
+
+## 9. Garantías y límites
 
 Lo que garantiza el script:
 
@@ -475,6 +858,10 @@ Lo que garantiza el script:
 - **No borra sin `--yes`**, y `--dry-run` muestra antes qué se borraría.
 - **Respeta tu `launch.json`.** Solo toca la entrada del microservicio. Si el
   archivo tiene comentarios o una forma inesperada, avisa y no lo toca.
+- **Calificar solo lee.** `check` no escribe nada en el repo (ni cachés de
+  `ruff` o `mypy`, ni `__pycache__`) y no ejecuta código del proyecto.
+- **`fix` no borra.** Solo escribe los archivos de los arreglos que pides, no
+  escribe a través de enlaces y no hace nada si ya está arreglado.
 
 Lo que no cubre:
 
@@ -487,7 +874,7 @@ Lo que no cubre:
 
 ---
 
-## 9. Errores comunes
+## 10. Errores comunes
 
 ### Del plugin
 
@@ -497,7 +884,7 @@ Lo que no cubre:
 | `Plugin "seedflow" not found in marketplace "looocust"` | Catálogo local desactualizado | `claude plugin marketplace update looocust` |
 | Instalé y los comandos no aparecen | Se instaló con una sesión abierta | `/reload-plugins` en la sesión, o reinicia `claude` |
 | `Skills (0)` en `claude plugin details seedflow` | `--plugin-dir` apunta a la raíz del repo | Apunta a `seedflow/plugins/seedflow` |
-| `already at the latest version` y no cambió nada | El repo cambió pero no la `version` | Ver [Actualizar](#10-actualizar-y-desinstalar) |
+| `already at the latest version` y no cambió nada | El repo cambió pero no la `version` | Ver [Actualizar](#11-actualizar-y-desinstalar) |
 
 ### Del script
 
@@ -517,9 +904,27 @@ Lo que no cubre:
 | `El borrado falló: … puede haber quedado incompleto` | El sistema no dejó borrar todo (archivo abierto, permisos) | Cierra lo que use esa carpeta y repite |
 | `pip install -r requirements.txt` falla con `lib-python-*` | Los repos son privados de `we-are-melonn` | Necesitas acceso a la organización y git autenticado (`gh auth login`) |
 
+### De la calificación (`check` y `fix`)
+
+| Mensaje | Causa | Solución |
+|---|---|---|
+| `no encontré proyectos en …/projects, así que no hay nota` | No estás en la raíz del repo, o no tiene `projects/` | Párate en la raíz (`status`) o usa `--root` |
+| `calidad de código: no evaluada (no se pudieron instalar ruff … y mypy …; se necesita internet la primera vez)` | Sin internet o sin `pip` la primera vez | Conéctate y califica de nuevo; el resto de la nota no cambia |
+| `no evaluada (el pyproject pide reportes de mypy (…); seedflow no escribe archivos al calificar)` | `[tool.mypy]` tiene `*_report` o `junit_xml` | Quita esas opciones del `pyproject.toml` o pásalas por línea de comandos cuando corras mypy a mano |
+| `no evaluada (el pyproject pide plugins de mypy (…); seedflow no ejecuta código del proyecto al calificar)` | `[tool.mypy]` tiene `plugins` | La calidad de ese proyecto no se puede calificar sin ejecutar esos plugins |
+| `no evaluada (exclude de mypy inválido en …)` | Una expresión regular de `exclude` no compila | Corrígela en el `pyproject.toml` |
+| `no evaluada (ruff falló (código N): …)` o `mypy falló …` | La herramienta salió con un error propio (configuración inválida, por ejemplo) | Corre `ruff check` o `mypy` a mano en `python/` para ver el detalle |
+| `[E4] … La regla de launch.json no se pudo evaluar` | `launch.json` tiene comentarios u otra forma, o es un enlace | Aviso de 0 puntos: revísalo a mano o déjalo como JSON simple |
+| `… es un enlace: lo que hay detrás no es parte del repo` | Una carpeta o archivo del proyecto es un enlace | Aviso de 0 puntos: reemplázalo por la carpeta o el archivo real para que se revise |
+| `Arreglo '…' no válido: se espera REGLA:proyecto/tipo/microservicio.` | El `fix_id` está mal escrito | Copia el id de `fix --list` |
+| `… no tiene el formato esperado (¿tiene comentarios?); actualízalo a mano.` | El arreglo E4 no puede editar ese `launch.json` | Agrega o quita la entrada a mano |
+| `… es un enlace simbólico; seedflow no escribe a través de enlaces. Agrega la línea .env a mano.` | El `.gitignore` de la raíz es un enlace | Agrega `.env` a mano en el archivo real |
+| `No existe …: créala a mano antes de agregar el evento.` | Al microservicio le falta `events/` (E2) | Crea `events/` y repite el arreglo E3 |
+| `El módulo de reglas … no cumple el contrato` | Un módulo de `scripts/checks/` no define `CATEGORY`, `QUICK` o `run` | Solo pasa al desarrollar reglas: ver [Desarrollo](#12-desarrollo) |
+
 ---
 
-## 10. Actualizar y desinstalar
+## 11. Actualizar y desinstalar
 
 ### Si lo usas
 
@@ -542,7 +947,7 @@ auto-update*.
 1. Sube la `version` en `plugins/seedflow/.claude-plugin/plugin.json`. **Sin
    esto, `claude plugin update` responde `already at the latest version`** y
    sigue usando la copia anterior.
-2. Corre los tests (ver [Desarrollo](#11-desarrollo)).
+2. Corre los tests (ver [Desarrollo](#12-desarrollo)).
 3. Haz commit y push a `main`.
 
 ### Desinstalar
@@ -553,11 +958,16 @@ claude plugin marketplace remove looocust   # opcional: quita también el catál
 ```
 
 Si lo instalaste con `./install.sh`, borra `~/.claude/seedflow/` y las carpetas
-`crear-proyecto`, `crear-microservicio` y `eliminar` de `~/.claude/skills/`.
+`crear-proyecto`, `crear-microservicio`, `eliminar` y `revisar` de
+`~/.claude/skills/`.
+
+En los dos casos, el entorno de `ruff` y `mypy` queda en
+`~/.cache/seedflow/` (Windows: `%LOCALAPPDATA%\seedflow\`): bórralo si ya no lo
+necesitas.
 
 ---
 
-## 11. Desarrollo
+## 12. Desarrollo
 
 ### Estructura del repositorio
 
@@ -566,12 +976,21 @@ seedflow/                               raíz del catálogo
 ├── .claude-plugin/marketplace.json     catálogo: looocust
 ├── install.sh                          instalación como skills sueltas
 ├── tests/
-│   ├── test_seedflow.py                suite (unittest)
-│   └── mutantes.py                     comprueba que la suite detecta fallas
+│   ├── test_seedflow.py                suite (unittest): crear y borrar
+│   ├── test_check_*.py                 suite: la nota y cada categoría de reglas
+│   ├── mutantes.py                     comprueba que la suite detecta fallas
+│   └── mutantes/                       las fallas, un archivo por tema, con su TARGET y sus TESTS
 └── plugins/seedflow/                   el plugin
     ├── .claude-plugin/plugin.json      nombre y versión
     ├── USO.md                          guía práctica de uso
-    ├── scripts/seedflow.py             el script
+    ├── scripts/
+    │   ├── seedflow.py                 el script: crea, borra, check y fix
+    │   └── checks/                     las reglas de la calificación
+    │       ├── __init__.py               contrato (Finding, Context…) y cálculo de la nota
+    │       ├── estructura.py             E1–E8 y sus arreglos
+    │       ├── calidad.py                C1–C4, entorno de ruff y mypy, y sus arreglos
+    │       ├── dependencias.py           D1–D3
+    │       └── higiene.py                H1–H4 y su arreglo
     ├── templates/                      archivos que se copian tal cual
     │   ├── project/                      deployment-scripts/, python/
     │   ├── microservice/                 events/, layers/, src/ (__name__ = nombre del microservicio)
@@ -582,7 +1001,8 @@ seedflow/                               raíz del catálogo
     └── skills/
         ├── crear-proyecto/SKILL.md
         ├── crear-microservicio/SKILL.md
-        └── eliminar/SKILL.md
+        ├── eliminar/SKILL.md
+        └── revisar/SKILL.md
 ```
 
 ### Cambiar lo que se genera
@@ -593,7 +1013,13 @@ seedflow/                               raíz del catálogo
 - **Las preguntas o lo que hace Claude:** edita el `SKILL.md` de la skill.
 - **Una librería nueva o una firma que cambió:** actualiza
   `references/librerias.md`, comprobándolo contra el código del monorepo
-  `melonn-common-python-packages`.
+  `melonn-common-python-packages`. Si cambia un import, actualiza también
+  `IMPORT_TO_REPO` en `scripts/checks/dependencias.py` (un test compara los dos).
+- **Una regla de la calificación:** va en el módulo de su categoría en
+  `scripts/checks/` (`check` descubre los módulos solo). Cada módulo expone
+  `CATEGORY`, `QUICK`, `run(ctx)` y, si tiene arreglos, `FIXES`. Agrega su test,
+  su falla en `tests/mutantes/` y su fila en la tabla de
+  [Reglas](#reglas).
 
 Para probar los cambios sin publicar, usa la vía C de instalación y
 `/reload-plugins`.
@@ -608,25 +1034,45 @@ python3 tests/mutantes.py                  # ¿la suite detecta fallas reales?
 claude plugin validate .                   # manifiestos y skills
 ```
 
-`mutantes.py` mete una falla por vez en una copia del script (sin validar
-nombres, sin `--yes`, sin rollback…) y verifica que algún test se ponga en
-rojo. **Si agregas una protección nueva, agrega también su falla a la lista.**
-Un resultado como `34/35 detectados` significa que hay un comportamiento sin
-test.
+`mutantes.py` mete una falla por vez en una copia de `scripts/` (sin validar
+nombres, sin `--yes`, una regla que no descuenta…) y verifica que algún test se
+ponga en rojo. **Si agregas una protección o una regla nueva, agrega también su
+falla.** Un resultado como `34/35 detectados` significa que hay un
+comportamiento sin test.
+
+Las fallas están en `tests/mutantes/`, un archivo por tema (`motor`,
+`puntaje`, `estructura`, `calidad`, `dependencias`, `higiene`…). Cada uno
+define `TARGET` (el archivo de `scripts/` que rompe), `MUTANTES` (la lista de
+fallas) y, opcionalmente, `TESTS` (los módulos de `tests/` que las cubren). Con
+`TESTS`, cada falla corre solo esos módulos, que es mucho más rápido; sin
+`TESTS`, corre la suite completa. Las fallas corren en paralelo:
+`SEEDFLOW_MUTANTES_JOBS=4 python3 tests/mutantes.py` fija cuántas a la vez
+(por defecto, la mitad de los núcleos).
+
+La suite nunca instala nada ni sale a internet: los tests de calidad usan
+`ruff` y `mypy` falsos, y los que corren `check` completo usan un
+`SEEDFLOW_TOOLS_DIR` temporal con `PIP_NO_INDEX=1`. Para correr además los
+tests contra `ruff` y `mypy` de verdad, apunta `SEEDFLOW_TEST_REAL_TOOLS` a un
+entorno ya instalado por seedflow (sin ella, esos tests se saltan):
+
+```bash
+SEEDFLOW_TEST_REAL_TOOLS=~/.cache/seedflow/tools/ruff-0.9.6_mypy-1.15.0 \
+  python3 -m unittest tests.test_check_calidad -v
+```
 
 Los tests que usan `cdk` y `npm` falsos o el bit de ejecución se saltan en
 Windows. Los de enlaces simbólicos se saltan si el sistema no permite crearlos.
 
 ---
 
-## 12. Diferencias con melonn-python-cli
+## 13. Diferencias con melonn-python-cli
 
 seedflow crea la misma estructura, con estos cambios:
 
 | melonn-python-cli | seedflow |
 |---|---|
 | Se instala con un `.whl` y un token en la URL; hoy falla al arrancar (`No module named 'click'`) | Plugin de Claude Code; el script no tiene dependencias |
-| `--help` de cada comando se cae; crear un microservicio desde `create-project` se cae | Probado con 66 tests |
+| `--help` de cada comando se cae; crear un microservicio desde `create-project` se cae | Probado con más de 200 tests y fallas a propósito (`tests/mutantes.py`) |
 | El handler generado no encuentra su evento (`../../events`) | Busca en `../events` y carga `python/.env` |
 | `iac/` queda con un repo git anidado; stack `IacStack` en todos los proyectos | Sin repo anidado; stack `<Proyecto>Stack` |
 | Un nombre como `..` podía borrar la carpeta actual entera | Nombres validados; nunca sale de `projects/` |

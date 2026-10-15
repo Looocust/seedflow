@@ -1,7 +1,7 @@
 {
   "name": "seedflow",
   "version": "0.2.0",
-  "description": "Scaffolding de proyectos y microservicios Melonn: preguntas en el chat, estructura determinista con un script sin dependencias y esqueleto de código con las librerías lib-python-*.",
+  "description": "Scaffolding de proyectos y microservicios Melonn: preguntas en el chat, estructura determinista con un script sin dependencias y esqueleto de código con las librerías lib-python-*. Además califica de 0 a 100 qué tan ordenado está el repo (estructura, calidad de código, dependencias, seguridad e higiene) y ofrece los arreglos mecánicos.",
   "author": {
     "name": "Looocust"
   },
@@ -11,6 +11,7 @@
     "aws-cdk",
     "lambda",
     "python",
-    "melonn"
+    "melonn",
+    "calificación"
   ]
 }

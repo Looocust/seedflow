@@ -28,6 +28,7 @@ Listo. Sin prefijo de plugin, los comandos son:
   /crear-proyecto        nuevo proyecto (deployment-scripts, iac con CDK, python)
   /crear-microservicio   nuevo microservicio dentro de un proyecto
   /eliminar              borrar un proyecto o un microservicio
+  /revisar               calificar qué tan ordenado está el repo y ofrecer arreglos
 
 Párate en la carpeta raíz del repo (data-hub, ds-core…) y empieza con:  /crear-proyecto
 MSG

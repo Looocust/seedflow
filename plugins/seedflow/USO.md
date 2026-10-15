@@ -90,6 +90,46 @@ un "ya lo confirmé" dentro del mismo pedido no cuenta.
 
 ---
 
+## Revisar qué tan ordenado está
+
+Al terminar de crear o eliminar algo, seedflow cierra con una línea así:
+
+```
+data-hub: 92/100 🟢 · 3 cosas por mejorar (sin calidad de código) · detalle: /seedflow:revisar
+```
+
+Para ver el detalle:
+
+```
+/revisar
+```
+
+O con tus palabras: "¿qué tan ordenado está esto?", "califica el repo".
+
+1. Califica de 0 a 100 cada proyecto en cuatro categorías: estructura, calidad
+   de código, dependencias, y seguridad e higiene. 🟢 75 o más · 🟡 de 50 a 74
+   · 🔴 menos de 50.
+2. Por cada cosa que descuenta te dice dónde está, cuántos puntos quita, por
+   qué importa y cómo arreglarlo.
+3. Aparte, anota lo que nota Claude y ninguna regla mide (por ejemplo, toda la
+   lógica en el handler). Eso no cambia la nota.
+4. Te ofrece los arreglos que son mecánicos (crear un evento que falta,
+   agregar `.env` al `.gitignore`, `ruff format`…) con los archivos que tocaría
+   cada uno. Solo los aplica si dices que sí; después vuelve a calificar.
+
+Para un `.env` commiteado o un `iac/.git` anidado no hay arreglo automático:
+te da opciones y cada una pide su propia confirmación.
+
+La primera vez instala `ruff` y `mypy` en un entorno propio de seedflow (no
+toca los tuyos): necesita internet y tarda cerca de un minuto. Sin internet, la
+calidad de código queda "no evaluada" y el resto se califica igual.
+
+Calificar solo lee: si no aceptas ningún arreglo, el repo queda igual. Las
+reglas completas y cómo se calcula la nota están en el README, sección
+"Calificación".
+
+---
+
 ## Preguntas frecuentes
 
 **¿Puedo seguir usando `melonn-python-cli`?** No: hoy falla al instalarse y al
@@ -104,5 +144,6 @@ que creó. Si no pudo deshacerlo todo, lo dice y lista las rutas que quedaron:
 bórralas a mano y vuelve a empezar.
 
 **¿Dónde está la referencia completa?** En el README del repo: instalación,
-guía de prueba, todos los comandos del script con sus opciones, errores comunes
-y cómo actualizar.
+guía de prueba, todos los comandos del script con sus opciones (también
+`check` y `fix`, para calificar y arreglar sin Claude), las reglas de la
+calificación, errores comunes y cómo actualizar.
