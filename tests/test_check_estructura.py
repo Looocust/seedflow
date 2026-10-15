@@ -149,6 +149,13 @@ class EstructuraTestCase(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             return self.estructura.FIXES[prefix](self.root, fix_id)
 
+    def link(self, path, target):
+        """Crea un enlace simbólico, o salta el test si no se puede."""
+        try:
+            path.symlink_to(target)
+        except OSError:
+            self.skipTest("no se pueden crear enlaces simbólicos")
+
     def seed_error(self):
         return self.estructura.seedflow.SeedError
 
@@ -280,6 +287,7 @@ class ProyectoTest(EstructuraTestCase):
             "export interface DemoIacStackProps {}\n"
         )
         (iac / "lib" / "notas.ts").write_text("// antes era IacStack\n")
+        (iac / "bin" / "iac.js").write_text("new IacStack();\n")
         (iac / "notas.ts").write_text("// antes era IacStack\n")
         self.assertEqual(self.findings("E7"), [])
 
@@ -411,6 +419,55 @@ class MicroservicioTest(EstructuraTestCase):
         self.assertFalse(handler.exists())
 
 
+class EnlacesYCarpetasTest(EstructuraTestCase):
+    def test_evento_que_es_carpeta_no_cuenta_y_no_se_arregla(self):
+        event = self.path(f"{ORDERS}/events/orders.json")
+        event.unlink()
+        event.mkdir()
+        (event / "algo.txt").write_text("mío")
+        (found,) = self.findings()
+        self.assert_finding(found, "E3", 3, f"{ORDERS}/events/orders.json")
+        self.assertIn("carpeta", found["message"])
+        with self.assertRaises(self.seed_error()):
+            self.fix("E3:demo/internal-services/orders")
+        self.assertEqual((event / "algo.txt").read_text(), "mío")
+
+    @unittest.skipIf(os.name == "nt", "enlaces simbólicos en Windows")
+    def test_handler_enlazado_no_se_lee(self):
+        afuera = self.base / "afuera"
+        (afuera / "src" / "service").mkdir(parents=True)
+        for folder in (afuera, afuera / "src"):
+            (folder / "handler.py").write_text(OLD_HANDLER)
+        handler = self.path(f"{ORDERS}/src/handler.py")
+        handler.unlink()
+        self.link(handler, afuera / "handler.py")
+        with self.subTest(enlace="src/handler.py"):
+            self.assertEqual(self.findings("E5"), [])
+        src = handler.parent
+        shutil.rmtree(src)
+        self.link(src, afuera / "src")
+        with self.subTest(enlace="src/"):
+            self.assertEqual(self.findings("E5"), [])
+
+    @unittest.skipIf(os.name == "nt", "enlaces simbólicos en Windows")
+    def test_iacstack_enlazado_no_se_lee(self):
+        afuera = self.base / "afuera"
+        (afuera / "lib").mkdir(parents=True)
+        for path in (afuera / "iac.ts", afuera / "lib" / "iac-stack.ts"):
+            path.write_text("export class IacStack extends cdk.Stack {}\n")
+        iac = self.path("projects/demo/iac")
+        (iac / "bin").mkdir()
+        self.link(iac / "bin" / "iac.ts", afuera / "iac.ts")
+        self.link(iac / "lib", afuera / "lib")
+        # Más abajo de lib/ tampoco se mira.
+        (iac / "bin" / "sub").mkdir()
+        (iac / "bin" / "sub" / "iac.ts").write_text("new IacStack();\n")
+        self.assertEqual(self.findings("E7"), [])
+        shutil.rmtree(iac)
+        self.link(iac, afuera)
+        self.assertEqual(self.findings("E7"), [])
+
+
 class LaunchTest(EstructuraTestCase):
     def test_launch_sin_entrada_o_con_entrada_huerfana(self):
         self.create_microservice("billing")
@@ -464,6 +521,21 @@ class LaunchTest(EstructuraTestCase):
         self.assertEqual(self.fix(found["fix_id"]), [launch])
         self.assertEqual(self.findings(), [])
 
+    def assert_launch_not_evaluated(self, report, reason):
+        """E4 avisa que no se evaluó (0 puntos, sin arreglo) y nada más."""
+        found = [f for f in report["findings"]
+                 if f["category"] == "estructura"]
+        # La regla de launch.json no descuenta; las demás sí.
+        self.assertEqual(sorted(f["rule"] for f in found), ["E3", "E4"])
+        (notice,) = [f for f in found if f["rule"] == "E4"]
+        self.assert_finding(notice, "E4", 0, LAUNCH)
+        self.assertIn("no se pudo evaluar", notice["message"])
+        self.assertIn(reason, notice["message"])
+        self.assertIn("a mano", notice["how"])
+        demo = report["projects"][0]
+        self.assertEqual(demo["categories"]["estructura"], 97)
+        self.assertNotIn("estructura", demo["not_evaluated"])
+
     def test_launch_con_comentarios_no_se_evalua(self):
         self.path(f"{ORDERS}/events/orders.json").unlink()  # otra regla
         self.create_microservice("billing")
@@ -475,17 +547,41 @@ class LaunchTest(EstructuraTestCase):
         ]:
             with self.subTest(contenido=content[:20]):
                 launch.write_text(content)
-                report = self.report()
-                found = [f for f in report["findings"]
-                         if f["category"] == "estructura"]
-                # La regla de launch.json no descuenta; las demás sí.
-                self.assertEqual([f["rule"] for f in found], ["E3"])
-                demo = report["projects"][0]
-                self.assertEqual(demo["categories"]["estructura"], 97)
-                self.assertNotIn("estructura", demo["not_evaluated"])
+                self.assert_launch_not_evaluated(self.report(), "formato")
                 with self.assertRaises(self.seed_error()):
                     self.fix("E4:demo/internal-services/billing")
                 self.assertEqual(launch.read_text(), content)
+
+    @unittest.skipIf(os.name == "nt", "enlaces simbólicos en Windows")
+    def test_launch_enlazado_no_se_lee(self):
+        self.path(f"{ORDERS}/events/orders.json").unlink()  # otra regla
+        afuera = self.base / "afuera"
+        afuera.mkdir()
+        # Afuera, un launch.json válido con una entrada huérfana: si se
+        # leyera, daría un hallazgo de 3 puntos.
+        data = self.read_launch()
+        data["configurations"].append(
+            self.seedflow.microservice_launch_config("viejo", "internal-services")
+        )
+        (afuera / "launch.json").write_text(json.dumps(data))
+        before = (afuera / "launch.json").read_text()
+        launch = self.path(LAUNCH)
+        vscode = launch.parent
+        launch.unlink()
+        self.link(launch, afuera / "launch.json")
+        with self.subTest(enlace="launch.json"):
+            self.assert_launch_not_evaluated(self.report(), "enlace")
+        shutil.rmtree(vscode)
+        self.link(vscode, afuera)
+        with self.subTest(enlace=".vscode"):
+            self.assert_launch_not_evaluated(self.report(), "enlace")
+            with self.assertRaises(self.seed_error()):
+                self.fix("E4:demo/internal-services/viejo")
+        self.assertEqual((afuera / "launch.json").read_text(), before)
+        (afuera / "launch.json").unlink()
+        with self.subTest(enlace=".vscode sin launch.json"):
+            # Tampoco cuenta como "falta launch.json": no se sabe qué hay.
+            self.assert_launch_not_evaluated(self.report(), "enlace")
 
 
 class ArreglosTest(EstructuraTestCase):

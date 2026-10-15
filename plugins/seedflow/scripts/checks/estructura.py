@@ -13,8 +13,10 @@
 | E7    | El stack de CDK no se llama IacStack                    | No      |
 | E8    | Los nombres cumplen las reglas de seedflow              | No      |
 
-run() solo lee. Los arreglos (FIXES) escriben solo el archivo de su arreglo,
-nunca a través de enlaces, y no hacen nada si ya está arreglado.
+run() solo lee, y nunca a través de enlaces: un archivo enlazado (o dentro de
+una carpeta enlazada) no se lee ni se califica. Los arreglos (FIXES) escriben
+solo el archivo de su arreglo, nunca a través de enlaces, y no hacen nada si
+ya está arreglado.
 """
 
 from __future__ import annotations
@@ -34,6 +36,7 @@ from checks import Context
 from checks import Finding
 from checks import Microservice
 from checks import Project
+from checks import iter_files
 
 
 CATEGORY = "estructura"
@@ -140,13 +143,17 @@ def found(
     message: str,
     how: str,
     fix_id: str | None = None,
+    points: int | None = None,
 ) -> Finding:
-    """Un hallazgo de la regla, con su gravedad y su porqué."""
+    """Un hallazgo de la regla, con su gravedad y su porqué.
+
+    points=0 es un aviso: la regla no se pudo evaluar ahí y no descuenta.
+    """
     severity, why = RULES[rule]
     return Finding(
         category=CATEGORY,
         rule=rule,
-        points=SEVERITY[severity],
+        points=SEVERITY[severity] if points is None else points,
         project=project.name,
         path=path.relative_to(root).as_posix(),
         message=message,
@@ -216,7 +223,7 @@ def iac_findings(root: Path, project: Project) -> Iterator[Finding]:
             "Muévelo a un respaldo fuera del repo, o bórralo si no necesitas "
             "ese historial; seedflow no lo borra solo porque se perdería.",
         )
-    stack = iac_stack_file(iac)
+    stack = iac_stack_file(project.path, iac)
     if stack is not None:
         yield found(
             root,
@@ -236,19 +243,47 @@ def camel(name: str) -> str:
     return "".join(p[:1].upper() + p[1:] for p in re.split(r"[-_]", name))
 
 
-def iac_stack_file(iac: Path) -> Path | None:
-    """El primer archivo del stack (bin/*.ts, lib/*-stack.ts) con IacStack."""
-    candidates = sorted([*iac.glob("bin/*.ts"), *iac.glob("lib/*-stack.ts")])
-    for path in candidates:
-        if IAC_STACK.search(read(path)):
+def iac_stack_file(base: Path, iac: Path) -> Path | None:
+    """El primer archivo del stack (bin/*.ts, lib/*-stack.ts) con IacStack.
+
+    read() no lee nada que esté en un enlace o debajo de uno (iac/ incluida).
+    """
+    for path in iter_files(iac):
+        stack = is_stack_file(path.relative_to(iac).parts)
+        if stack and IAC_STACK.search(read(base, path)):
             return path
     return None
 
 
-def read(path: Path) -> bytes:
-    """Contenido de un archivo; vacío si no es un archivo o no se puede leer."""
+def is_stack_file(parts: tuple[str, ...]) -> bool:
+    """bin/<algo>.ts o lib/<algo>-stack.ts, sin bajar más."""
+    if len(parts) != 2:
+        return False
+    folder, name = parts
+    if folder == "bin":
+        return name.endswith(".ts")
+    return folder == "lib" and name.endswith("-stack.ts")
+
+
+def through_link(base: Path, path: Path) -> bool:
+    """Si path, o alguna carpeta entre base y path, es un enlace."""
+    current = base
+    for part in path.relative_to(base).parts:
+        current = current / part
+        if seedflow.is_link(current):
+            return True
+    return False
+
+
+def read(base: Path, path: Path) -> bytes:
+    """Contenido de un archivo bajo base; vacío si no se puede o no se debe.
+
+    No lee a través de enlaces: su contenido no es parte del repo.
+    """
+    if through_link(base, path) or not path.is_file():
+        return b""
     try:
-        return path.read_bytes() if path.is_file() else b""
+        return path.read_bytes()
     except OSError:
         return b""
 
@@ -284,8 +319,18 @@ def microservice_findings(
                 "E3", project.name, microservice.service_type, microservice.name
             ),
         )
+    elif events.is_dir() and not event.is_file():
+        yield found(
+            root,
+            project,
+            "E3",
+            event,
+            f"events/{microservice.name}.json es una carpeta, no un archivo.",
+            "Mueve lo que tenga esa carpeta y crea en su lugar el archivo del "
+            "evento (seedflow no la borra).",
+        )
     handler = microservice.path / "src" / "handler.py"
-    if BROKEN_EVENTS in read(handler):
+    if BROKEN_EVENTS in read(microservice.path, handler):
         yield found(
             root,
             project,
@@ -319,8 +364,23 @@ def launch_findings(root: Path, project: Project) -> Iterator[Finding]:
     ese proyecto: no descuenta (las demás reglas sí).
     """
     path = project.path / "python" / ".vscode" / "launch.json"
+    if through_link(project.path, path):
+        yield launch_not_evaluated(
+            root,
+            project,
+            path,
+            "es un enlace (o está en una carpeta enlazada) y seedflow no lee "
+            "a través de enlaces",
+        )
+        return
     data = seedflow.load_launch(path)
     if data is None:
+        yield launch_not_evaluated(
+            root,
+            project,
+            path,
+            "no tiene el formato esperado (¿tiene comentarios?)",
+        )
         return
     entries = launch_entries(data)
     existing = {(m.service_type, m.name) for m in project.microservices}
@@ -345,6 +405,24 @@ def launch_findings(root: Path, project: Project) -> Iterator[Finding]:
             "Quita esa configuración de launch.json.",
             fix_id_for("E4", project.name, service_type, name),
         )
+
+
+def launch_not_evaluated(
+    root: Path, project: Project, path: Path, reason: str
+) -> Finding:
+    """Aviso de 0 puntos: la regla de launch.json no se evaluó ahí."""
+    return found(
+        root,
+        project,
+        "E4",
+        path,
+        f"La regla de launch.json no se pudo evaluar: el archivo {reason}. "
+        "No descuenta.",
+        "Revisa a mano que tenga una entrada por microservicio y ninguna de "
+        "un microservicio que no existe; o déjalo como JSON simple, fuera de "
+        "un enlace, para que seedflow lo revise.",
+        points=0,
+    )
 
 
 # --------------------------------------------------------------------------
@@ -389,8 +467,12 @@ def fix_event(root: Path, fix_id: str) -> list[Path]:
             f"No existe {events}: créala a mano antes de agregar el evento."
         )
     event = seedflow.safe_path(events, f"{target.name}.json")
-    if event.exists():
+    if event.is_file():
         return []
+    if event.exists():
+        raise seedflow.SeedError(
+            f"{event} existe y no es un archivo: arréglalo a mano."
+        )
     with event.open("x", encoding="utf-8") as file:
         file.write("{}\n")
     return [event]
