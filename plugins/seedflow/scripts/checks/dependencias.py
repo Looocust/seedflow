@@ -48,10 +48,11 @@ IMPORT_TO_REPO = {
 # Un comentario de requirements empieza con '#' al inicio o tras un espacio
 # (así `...@sha#egg=...` no es un comentario).
 COMMENT = re.compile(r"(^|\s)#.*$")
-# El repo va al inicio de la línea o tras '/' (en la URL); la versión, tras @.
+# El repo va al inicio de la línea, tras espacios o tras '/' (en la URL), con
+# o sin especificador (`==1.0`, `[extra]`); la versión de git va tras '@'.
 LIBRARY = re.compile(
-    r"(?:^|/)(?P<repo>lib-python-[A-Za-z0-9_-]+)(?:\.git)?"
-    r"(?:@(?P<ref>[^\s#;]+))?(?=$|[\s#;])"
+    r"(?:^|[\s/])(?P<repo>lib-python-[A-Za-z0-9_-]+)(?:\.git)?"
+    r"(?:@(?P<ref>[^\s#;]+))?"
 )
 SHA = re.compile(r"[0-9a-fA-F]{7,40}")
 
@@ -132,7 +133,8 @@ def read_requirements(
 ) -> list[tuple[int, str, str, str]]:
     """(número, línea tal cual, repo, versión) de cada lib-python-*.
 
-    La versión es '' si la línea no tiene '@'. Las líneas comentadas no
+    La línea va tal cual (sin el salto de línea). La versión es '' si no
+    tiene '@' (también con un especificador como `==1.0`). Las comentadas no
     cuentan, y un archivo que no existe o es un enlace no tiene líneas.
     """
     path = regular_file(base, *parts)
@@ -148,9 +150,7 @@ def read_requirements(
         if matches:
             # Con `nombre @ url`, la que manda es la de la URL (la última).
             last = matches[-1]
-            found.append(
-                (number, line.strip(), last["repo"], last["ref"] or "")
-            )
+            found.append((number, line, last["repo"], last["ref"] or ""))
     return found
 
 

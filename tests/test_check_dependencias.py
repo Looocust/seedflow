@@ -235,6 +235,58 @@ class ShaTest(DependenciasTestCase):
                     )
         self.assertEqual(self.project(report)["categories"]["dependencias"], 60)
 
+    def test_libreria_sin_url_o_con_version_estilo_pypi_es_d1(self):
+        self.create_project()
+        self.create_microservice("orders")
+        en_python = self.line_count(self.python_reqs())
+        en_layers = self.line_count(self.layers("orders"))
+        lineas_python = [
+            "lib-python-aws-utils==1.0.0",
+            "  lib-python-melogger",
+            "lib-python-validator>=2 ; python_version >= '3.8'",
+        ]
+        lineas_layers = [
+            "lib-python-redshift-connector",
+            "\tlib-python-custom-errors~=1.0",
+            "lib-python-slack-notifier[extra]",
+        ]
+        self.append(self.python_reqs(), *lineas_python)
+        self.append(self.layers("orders"), *lineas_layers)
+        report = self.check()
+        found = self.findings(report)
+        esperados = [
+            (self.python_reqs(), en_python + i + 1, linea)
+            for i, linea in enumerate(lineas_python)
+        ] + [
+            (self.layers("orders"), en_layers + i + 1, linea)
+            for i, linea in enumerate(lineas_layers)
+        ]
+        self.assertEqual(len(found), len(esperados), found)
+        for path, number, linea in esperados:
+            with self.subTest(linea=linea):
+                matches = [
+                    f for f in found
+                    if f["path"] == path
+                    and f"(línea {number}: {linea})" in f["message"]
+                ]
+                self.assertEqual(len(matches), 1, found)
+                self.assertEqual(matches[0]["rule"], "D1")
+                self.assertEqual(matches[0]["points"], 10)
+        self.assertEqual(self.project(report)["categories"]["dependencias"], 40)
+
+    def test_hallazgo_trae_la_linea_tal_cual(self):
+        self.create_project()
+        self.create_microservice("orders")
+        numero = self.line_count(self.layers("orders")) + 1
+        linea = "   " + lib("lib-python-aws-utils", "main") + "   "
+        self.append(self.layers("orders"), linea)
+        found = self.findings(self.check())
+        self.assertEqual(len(found), 1, found)
+        self.assertTrue(
+            found[0]["message"].endswith(f"(línea {numero}: {linea})"),
+            found[0]["message"],
+        )
+
     def test_sha_distinto_entre_layers_y_python(self):
         self.create_project()
         self.create_microservice("orders")
