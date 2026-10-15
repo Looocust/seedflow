@@ -70,8 +70,15 @@ class DependenciasTestCase(unittest.TestCase):
         self.base = Path(temp.name).resolve()
         self.root = self.base / "repo"
         self.root.mkdir()
+        # Sin repo git por encima del temporal, y sin instalar herramientas
+        # de calidad desde internet si check corre con todas las reglas.
         patcher = mock.patch.dict(
-            os.environ, {"GIT_CEILING_DIRECTORIES": str(self.base)}
+            os.environ,
+            {
+                "GIT_CEILING_DIRECTORIES": str(self.base),
+                "SEEDFLOW_TOOLS_DIR": str(self.base / "tools"),
+                "PIP_NO_INDEX": "1",
+            },
         )
         patcher.start()
         self.addCleanup(patcher.stop)

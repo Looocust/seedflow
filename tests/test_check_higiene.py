@@ -70,6 +70,9 @@ class HigieneTestCase(unittest.TestCase):
             "GIT_CEILING_DIRECTORIES": str(self.base),
             "GIT_CONFIG_GLOBAL": str(empty_config),
             "XDG_CONFIG_HOME": str(self.base / "xdg"),
+            # Sin instalar herramientas de calidad desde internet.
+            "SEEDFLOW_TOOLS_DIR": str(self.base / "tools"),
+            "PIP_NO_INDEX": "1",
         })
         patcher.start()
         self.addCleanup(patcher.stop)
