@@ -23,6 +23,10 @@ en el paquete checks/ (un módulo por categoría, que check descubre solo);
 este script arma el contexto, las corre y muestra la nota. --quick deja fuera
 las reglas lentas (calidad de código) e imprime una sola línea.
 
+fix --list muestra los arreglos mecánicos que ofrece check (cada fix_id con
+lo que hace y los archivos que tocaría); fix FIX_ID... aplica solo esos, una
+vez cada uno y en orden estable, con los FIXES de cada módulo de reglas.
+
 Garantías:
 
 - Nunca opera fuera de <raíz>/projects/ ni a través de enlaces simbólicos.
@@ -30,6 +34,8 @@ Garantías:
 - Si una creación falla a mitad de camino, deja la raíz como estaba; si no
   puede, lo dice y lista lo que quedó.
 - check solo lee: nunca escribe en el repo.
+- fix solo escribe los archivos de los arreglos pedidos, nunca borra, y
+  valida todos los fix_id antes de aplicar el primero.
 
 No cubre dos comandos de seedflow corriendo a la vez sobre el mismo proyecto,
 ni otro proceso que cambie carpetas por enlaces mientras el comando corre
@@ -51,6 +57,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from collections.abc import Callable
 from collections.abc import Iterator
 from pathlib import Path
 from types import ModuleType
@@ -908,7 +915,11 @@ def print_finding(finding: checks.Finding) -> None:
         if finding.fix_id
         else "a mano"
     )
-    say(f"   ❗ [{finding.rule}] -{finding.points} · {finding.path}")
+    # Un hallazgo de 0 puntos es un aviso (algo que no se pudo revisar).
+    head = f"❗ [{finding.rule}] -{finding.points}"
+    if not finding.points:
+        head = f"⚠️  [{finding.rule}] aviso"
+    say(f"   {head} · {finding.path}")
     say(f"      {finding.message}")
     say(f"      Por qué: {finding.why}")
     say(f"      Cómo: {finding.how} ({fix})")
@@ -946,9 +957,173 @@ def check_repo(args: argparse.Namespace) -> None:
         print_report(report)
 
 
+# --------------------------------------------------------------------------
+# Arreglos (fix)
+# --------------------------------------------------------------------------
+
+
 def cmd_fix(args: argparse.Namespace) -> None:
-    """Aplica arreglos mecánicos (lo completa la tarea T-006)."""
-    raise SeedError("'fix' todavía no está disponible.")
+    """Lista o aplica arreglos mecánicos. Nunca borra archivos."""
+    # Como check: importar checks/ no deja __pycache__ en el repo.
+    with without_bytecode():
+        fix_repo(args)
+
+
+def fix_repo(args: argparse.Namespace) -> None:
+    """--list muestra los arreglos que ofrece check; con ids, los aplica."""
+    root = Path(args.root).resolve()
+    if args.list and args.fix_ids:
+        raise SeedError(
+            "Usa 'fix --list' para ver los arreglos o 'fix ID...' para "
+            "aplicarlos, no los dos a la vez. No cambié nada."
+        )
+    if not args.fix_ids and not args.list:
+        say(
+            "No pediste ningún arreglo, así que no cambié nada. Los "
+            "disponibles salen con: seedflow.py fix --list"
+        )
+        return
+    modules = discover_rules()
+    if args.list:
+        print_fixes(root, offered_fixes(root, modules))
+        return
+    # Una vez cada uno y en orden estable: C1 (ruff check --fix) antes que
+    # C2 (ruff format), porque quitar un import puede dejar algo por formatear.
+    fix_ids = sorted(set(args.fix_ids))
+    owners = [
+        module
+        for module in modules
+        if any(fix_prefix(i) in fixes_of(module) for i in fix_ids)
+    ]
+    offered = offered_fixes(root, owners)
+    unknown = [fix_id for fix_id in fix_ids if fix_id not in offered]
+    if unknown:
+        raise SeedError(
+            f"check no ofrece {', '.join(unknown)}: no apliqué ningún "
+            "arreglo. Los disponibles salen con: seedflow.py fix --list"
+        )
+    apply_fixes(root, fix_ids, owners)
+
+
+def fix_prefix(fix_id: str) -> str:
+    """'E3' de 'E3:proyecto/tipo/microservicio': la clave en FIXES."""
+    return fix_id.partition(":")[0]
+
+
+def fixes_of(
+    module: ModuleType,
+) -> dict[str, Callable[[Path, str], list[Path]]]:
+    """Los arreglos de un módulo de reglas (los que no ofrece, {})."""
+    fixes = getattr(module, "FIXES", None)
+    return fixes if isinstance(fixes, dict) else {}
+
+
+def all_fixes(
+    modules: list[ModuleType],
+) -> dict[str, Callable[[Path, str], list[Path]]]:
+    """Los arreglos de esos módulos, por prefijo de fix_id."""
+    fixes: dict[str, Callable[[Path, str], list[Path]]] = {}
+    for module in modules:
+        fixes.update(fixes_of(module))
+    return fixes
+
+
+def offered_fixes(
+    root: Path, modules: list[ModuleType]
+) -> dict[str, list[checks.Finding]]:
+    """Cada fix_id que ofrece check, en orden, con los hallazgos que arregla.
+
+    Califica con todas las reglas de esos módulos (también calidad): solo se
+    aplica lo que check ofrece en este momento.
+    """
+    fixes = all_fixes(modules)
+    report = load_checks().evaluate(build_context(root, False), modules)
+    offered: dict[str, list[checks.Finding]] = {}
+    for finding in report.findings:
+        if finding.fix_id and fix_prefix(finding.fix_id) in fixes:
+            offered.setdefault(finding.fix_id, []).append(finding)
+    return {fix_id: offered[fix_id] for fix_id in sorted(offered)}
+
+
+def print_fixes(root: Path, offered: dict[str, list[checks.Finding]]) -> None:
+    """Cada arreglo con lo que hace y los archivos que tocaría."""
+    if not offered:
+        say("✅ No hay arreglos mecánicos pendientes: no hay nada que aplicar.")
+        return
+    count = plural(len(offered), "arreglo", "arreglos")
+    say(f"🔧 {count} que seedflow puede hacer solo:")
+    for fix_id, findings in offered.items():
+        say(f"\n   {fix_id}")
+        for how in dict.fromkeys(finding.how for finding in findings):
+            say(f"      {how}")
+        paths = sorted({finding.path for finding in findings})
+        shown = [f"{p}/" if (root / p).is_dir() else p for p in paths]
+        say(f"      Toca: {', '.join(shown)}")
+    say("\nAplícalos con: seedflow.py fix ID [ID ...]")
+
+
+def apply_fixes(
+    root: Path, fix_ids: list[str], modules: list[ModuleType]
+) -> None:
+    """Aplica cada arreglo y muestra los archivos que tocó.
+
+    Un error de un arreglo se reporta sin traceback y detiene los que
+    siguen; los anteriores quedan aplicados (y se dice cuáles).
+    """
+    fixes = all_fixes(modules)
+    errors = fix_errors(modules)
+    touched: set[Path] = set()
+    for done, fix_id in enumerate(fix_ids):
+        say(f"🔧 {fix_id}")
+        try:
+            files = fixes[fix_prefix(fix_id)](root, fix_id)
+        except errors as error:
+            applied = (
+                f" Ya quedaron aplicados: {', '.join(fix_ids[:done])}."
+                if done
+                else ""
+            )
+            raise SeedError(
+                f"No pude aplicar {fix_id}: {error}{applied}"
+            ) from error
+        for path in files:
+            say(f"   ✏️  {shown_path(root, path)}")
+        if not files:
+            say("   ya estaba bien: no cambié nada")
+        touched.update(files)
+    say(
+        f"✅ {plural(len(fix_ids), 'arreglo aplicado', 'arreglos aplicados')}"
+        f" · {plural(len(touched), 'archivo tocado', 'archivos tocados')}. "
+        "Califica de nuevo con check para ver la nota nueva."
+    )
+
+
+def plural(count: int, one: str, many: str) -> str:
+    """'1 arreglo aplicado' o '3 arreglos aplicados'."""
+    return f"1 {one}" if count == 1 else f"{count} {many}"
+
+
+def fix_errors(modules: list[ModuleType]) -> tuple[type[Exception], ...]:
+    """Los errores esperados de un arreglo, que se muestran sin traceback.
+
+    Incluye el SeedError de la copia de seedflow que importó cada módulo:
+    si este script corre como __main__ (o lo cargan con otro nombre), esa
+    copia tiene su propia clase SeedError.
+    """
+    errors: list[type[Exception]] = [SeedError, ValueError, OSError]
+    for module in modules:
+        other = getattr(getattr(module, "seedflow", None), "SeedError", None)
+        if isinstance(other, type) and issubclass(other, Exception):
+            errors.append(other)
+    return tuple(errors)
+
+
+def shown_path(root: Path, path: Path) -> str:
+    """La ruta relativa a la raíz, si está dentro de ella."""
+    try:
+        return Path(path).relative_to(root).as_posix()
+    except ValueError:
+        return str(path)
 
 
 # --------------------------------------------------------------------------
@@ -1066,4 +1241,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    # Los módulos de checks/ hacen `import seedflow`: que reciban este mismo
+    # módulo y no una segunda copia, con otra clase SeedError.
+    sys.modules.setdefault("seedflow", sys.modules[__name__])
     sys.exit(main())
